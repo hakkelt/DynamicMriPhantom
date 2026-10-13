@@ -1,0 +1,20 @@
+Code is written for VS Code running on Linux Mint 22.3
+These are the required changes when switching between boards.
+
+ESP32S3 Dev Module [ESP]
+Atmel atmega328pb Xplained mini [Atmel]
+
+_____________________________________________________________
+[ESP]:
+
+Port: /dev/ttyACM0
+
+In csv_maker.py NUM_POINTS can be higher, like 1024
+
+_____________________________________________________________
+[Atmel]:
+
+Port: /dev/ttyUSB0
+
+In csv_maker.py set NUM_POINTS to max 256
+

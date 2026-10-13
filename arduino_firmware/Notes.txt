@@ -1,0 +1,32 @@
+Code is written for ArduinoIDE running on Linux Mint 22.3
+These are the required changes when switching between boards.
+
+_____________________________________________________________
+Boards [short name]:
+ESP32S3 Dev Module [ESP]
+Atmel atmega328pb Xplained mini [Atmel]
+
+_____________________________________________________________
+[ESP]:
+const int dirPin = 5;
+const int stepPin = 6;
+const int buttonPin = 8;
+const int mriPin = 9;
+
+USB CDC On Boot: "Enabled"
+
+Port: /dev/ttyACM0
+
+In csv_reader MAX_POINTS can be higher, like 1024
+
+_____________________________________________________________
+[Atmel]:
+const int dirPin = 2;
+const int stepPin = 3;
+const int buttonPin = 5;
+const int mriPin = 6;
+
+Port: /dev/ttyUSB0
+
+In csv_reader set MAX_POINTS to max 256
+
