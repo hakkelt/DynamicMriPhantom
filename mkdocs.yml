@@ -1,0 +1,40 @@
+site_name: Dynamic MRI Phantom Controller
+site_url: https://hakkelt.github.io/DynamicMriPhantom/
+repo_url: https://github.com/hakkelt/DynamicMriPhantom
+edit_uri: edit/master/docs/
+docs_dir: docs
+exclude_docs: |
+  *.py
+  __pycache__/
+
+nav:
+  - How it works: README.md
+  - Reference: reference.md
+
+hooks:
+  - docs/hooks.py
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.sections
+    - toc.integrate
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle: { icon: material/weather-night, name: Dark mode }
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle: { icon: material/weather-sunny, name: Light mode }
+
+markdown_extensions:
+  - tables
+  - admonition
+  - toc:
+      permalink: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format

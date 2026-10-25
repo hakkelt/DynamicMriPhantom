@@ -1,5 +1,6 @@
 # build output and fetched dependencies
 build/
+site/
 .deps/
 emulator/avr/node_modules/
 

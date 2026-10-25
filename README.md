@@ -12,7 +12,7 @@ only plays the schedule back from a hardware timer, so the motion is known to
 the microsecond relative to the TTL. The push button is a **debug feature** that
 stands in for the MRI during development.
 
-**→ [How it works](docs/README.md)**: diagrams of the system, the scan sequence,
+**→ [How it works](docs/README.md)** ([website](https://hakkelt.github.io/DynamicMriPhantom/)): diagrams of the system, the scan sequence,
 the firmware state machine and the timing, with measured figures.
 
 ```
