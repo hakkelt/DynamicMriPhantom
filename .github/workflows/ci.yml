@@ -30,10 +30,10 @@ jobs:
       - name: Install the emulator (avr8js)
         run: npm ci --prefix emulator/avr
 
-      - name: Build firmware (ATmega328P for the emulator, ATmega328PB compile check)
-        run: |
-          emulator/build_avr.sh atmega328p
-          emulator/build_avr.sh atmega328pb
+      # The 328PB build is checked by the arduino-cli job (MiniCore): Ubuntu's
+      # avr-libc 2.0.0 has incomplete ATmega328PB headers.
+      - name: Build firmware (ATmega328P for the emulator)
+        run: emulator/build_avr.sh atmega328p
 
       - name: Run tests
         env:

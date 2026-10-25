@@ -5,7 +5,9 @@
 #
 # Output: build/avr-<mcu>/segment_player.{elf,hex}
 # The atmega328p build is what the avr8js emulator runs; the 328PB build checks
-# that the sketch also compiles for the Xplained Mini (same Timer1/PORTD/PCINT2).
+# that the sketch also compiles for the Xplained Mini (same Timer1/PORTD/PCINT2);
+# it needs the Arduino AVR toolchain (Ubuntu's avr-libc 2.0.0 lacks complete
+# ATmega328PB headers).
 #
 # Needs avr-gcc/avr-g++/avr-objcopy/avr-size on PATH (or AVR_GCC_BIN=<dir>).
 # ArduinoCore-avr is cloned into .deps/ (pinned tag) unless ARDUINO_CORE_AVR is set.
