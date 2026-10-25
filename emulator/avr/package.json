@@ -1,0 +1,12 @@
+{
+  "name": "phantom-avr-emulator",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Runs the segment_player firmware (ATmega328P @ 16 MHz) in avr8js with serial over TCP and a pin trace",
+  "type": "module",
+  "main": "run_avr.mjs",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "avr8js": "0.21.1"
+  }
+}

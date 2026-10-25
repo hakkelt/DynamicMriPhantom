@@ -1,0 +1,35 @@
+segment_player firmware: board notes
+====================================
+
+The same sketch (segment_player/segment_player.ino + seg_engine.h) builds for
+both boards; pins and limits are selected automatically by the board macros.
+
+ATmega328PB Xplained Mini  [AVR]
+--------------------------------
+Pins: DIR=D2  STEP=D3  MRI TTL=D6 (sequence start)  BUTTON=D5 (debug, to GND)
+Core: any Arduino core with ATmega328PB support (e.g. MiniCore, variant 328PB,
+      16 MHz). The sketch only uses Timer1, PORTD and PCINT2, which are the
+      same on the 328P, so an Uno/Nano also works for testing.
+Port: /dev/ttyUSB0 (or /dev/ttyACM0 for the on-board mEDBG)
+Limits reported in CAPS: 72 segments, 20 kHz step rate, 40 us min event spacing.
+Timer0 (millis) is paused during playback to remove step jitter.
+
+ESP32-S3 Dev Module  [ESP]   -- NOT yet tested on hardware
+--------------------------------
+Pins: DIR=5  STEP=6  MRI TTL=9 (3.3 V input! level-shift a 5 V TTL)  BUTTON=8 (debug)
+Core: Arduino-ESP32 3.x (uses the ESP-IDF 5 gptimer driver directly)
+Tools > USB CDC On Boot: "Enabled"
+Port: /dev/ttyACM0
+Limits reported in CAPS: 4096 segments, 50 kHz step rate.
+
+Microstep jumpers
+-----------------
+The firmware cannot set microstepping. The GUI shows the M0/M1/M2 (DRV8825)
+or MS1/MS2/MS3 (A4988) levels for the compiled trajectory and asks for a
+confirmation before upload.
+
+Triggers
+--------
+MRI TTL (D6 / GPIO9): the first rising edge marks the start of the sequence
+execution and is time zero of the motion (ground truth); later edges are
+ignored. BUTTON is a debug stand-in for the MRI during development.

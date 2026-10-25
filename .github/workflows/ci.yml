@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Python, host engine, AVR emulator and GUI tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: emulator/avr/package-lock.json
+
+      - name: Install AVR toolchain and Xvfb
+        run: sudo apt-get update && sudo apt-get install -y gcc-avr avr-libc xvfb
+
+      - name: Install Python packages
+        run: pip install -r python_serial/requirements.txt
+
+      - name: Install the emulator (avr8js)
+        run: npm ci --prefix emulator/avr
+
+      - name: Build firmware (ATmega328P for the emulator, ATmega328PB compile check)
+        run: |
+          emulator/build_avr.sh atmega328p
+          emulator/build_avr.sh atmega328pb
+
+      - name: Run tests
+        env:
+          PHANTOM_SCREENSHOT_DIR: screenshots
+        run: xvfb-run -a -s "-screen 0 1600x1000x24" python -m pytest -v -rs
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gui-screenshots
+          path: screenshots/
+          if-no-files-found: ignore
+
+  arduino-compile:
+    name: Arduino compile (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Uno (ATmega328P)
+            core: arduino:avr
+            fqbn: arduino:avr:uno
+            url: ""
+          - name: ATmega328PB (MiniCore)
+            core: MiniCore:avr
+            fqbn: MiniCore:avr:328:variant=modelPB,clock=16MHz_external
+            url: https://mcudude.github.io/MiniCore/package_MCUdude_MiniCore_index.json
+          - name: ESP32-S3
+            core: esp32:esp32@3.0.7
+            fqbn: esp32:esp32:esp32s3:CDCOnBoot=cdc
+            url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install core
+        run: |
+          arduino-cli core update-index ${{ matrix.url && format('--additional-urls {0}', matrix.url) }}
+          arduino-cli core install "${{ matrix.core }}" ${{ matrix.url && format('--additional-urls {0}', matrix.url) }}
+      - name: Compile
+        run: >
+          arduino-cli compile --warnings all --fqbn "${{ matrix.fqbn }}"
+          ${{ matrix.url && format('--additional-urls {0}', matrix.url) }}
+          arduino_firmware/segment_player
