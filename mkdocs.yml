@@ -8,8 +8,11 @@ exclude_docs: |
   __pycache__/
 
 nav:
-  - How it works: README.md
-  - Reference: reference.md
+  - Overview: index.md
+  - Trajectory format: trajectory.md
+  - Main window: gui.md
+  - Trajectory designer: designer.md
+  - Firmware: firmware.md
 
 hooks:
   - docs/hooks.py
