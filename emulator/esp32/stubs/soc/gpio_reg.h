@@ -1,0 +1,3 @@
+#pragma once
+#define GPIO_OUT_W1TS_REG 0x60004008u
+#define GPIO_OUT_W1TC_REG 0x6000400Cu

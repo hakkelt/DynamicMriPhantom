@@ -20,6 +20,7 @@ from tkinter.scrolledtext import ScrolledText
 from typing import Optional
 
 import phantom_core as pc
+import phantom_style as ps
 from phantom_device import TRIGGERS, DeviceError, PhantomDevice
 
 EMULATOR_URL = "socket://127.0.0.1:5555"
@@ -47,13 +48,15 @@ class PhantomApp:
     def __init__(self, root: tk.Tk, port: Optional[str] = None):
         self.root = root
         root.title("Dynamic MRI phantom controller")
-        root.geometry("1000x760")
+        root.geometry("1120x800")
+        root.minsize(980, 700)
         self.dev: Optional[PhantomDevice] = None
         self.traj: Optional[pc.CompiledTrajectory] = None
         self.traj_path: Optional[str] = None
         self.uploaded_checksum: Optional[int] = None  # program on the device
         self.running = False
         self.designer = None
+        self.dev_state = "offline"
         self._ui_queue: "queue.Queue" = queue.Queue()
         self._build()
         if port:
@@ -64,109 +67,162 @@ class PhantomApp:
     # -- layout -------------------------------------------------------------
     def _build(self) -> None:
         r = self.root
-        top = ttk.LabelFrame(r, text="Device", padding=6)
-        top.pack(fill=tk.X, padx=6, pady=4)
-        ttk.Label(top, text="Port").pack(side=tk.LEFT)
+        ps.apply_theme(r)
+        outer = ttk.Frame(r, padding=(10, 8))
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        # Header: title, device line and the state badge.
+        head = ttk.Frame(outer, style="Card.TFrame", padding=(14, 10))
+        head.pack(fill=tk.X)
+        titles = ttk.Frame(head, style="Card.TFrame")
+        titles.pack(side=tk.LEFT)
+        ttk.Label(titles, text="Dynamic MRI phantom", style="Title.TLabel").pack(anchor="w")
+        self.dev_label = ttk.Label(titles, text="not connected", style="Subtitle.TLabel")
+        self.dev_label.pack(anchor="w")
+        self.state_badge = ps.Badge(head, "OFFLINE", "offline")
+        self.state_badge.pack(side=tk.RIGHT, padx=(10, 0))
+        conn = ttk.Frame(head, style="Card.TFrame")
+        conn.pack(side=tk.RIGHT)
+        ttk.Label(conn, text="Port", style="Muted.TLabel").pack(side=tk.LEFT)
         self.port_var = tk.StringVar()
-        self.port_box = ttk.Combobox(top, textvariable=self.port_var, values=list_ports(), width=34)
-        self.port_box.pack(side=tk.LEFT, padx=4)
+        self.port_box = ttk.Combobox(conn, textvariable=self.port_var, values=list_ports(), width=28)
+        self.port_box.pack(side=tk.LEFT, padx=6)
         if self.port_box["values"]:
             self.port_var.set(self.port_box["values"][0])
-        ttk.Button(top, text="Refresh", command=self._refresh_ports).pack(side=tk.LEFT)
-        self.connect_btn = ttk.Button(top, text="Connect", command=self.toggle_connect)
-        self.connect_btn.pack(side=tk.LEFT, padx=4)
-        self.dev_label = ttk.Label(top, text="not connected", foreground="#888")
-        self.dev_label.pack(side=tk.LEFT, padx=6)
+        ttk.Button(conn, text="Rescan", command=self._refresh_ports).pack(side=tk.LEFT)
+        self.connect_btn = ttk.Button(conn, text="Connect", style="Accent.TButton", command=self.toggle_connect)
+        self.connect_btn.pack(side=tk.LEFT, padx=(6, 0))
 
-        mid = ttk.Frame(r)
-        mid.pack(fill=tk.X, padx=6)
-        tf = ttk.LabelFrame(mid, text="Trajectory", padding=6)
-        tf.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        bar = ttk.Frame(tf)
+        body = ttk.Frame(outer)
+        body.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        # Left: trajectory summary.
+        tf = ps.card(body, "Trajectory")
+        tf.grid(row=0, column=0, sticky="nsew")
+        bar = ttk.Frame(tf, style="Card.TFrame")
         bar.pack(fill=tk.X)
         ttk.Button(bar, text="Open…", command=self.open_file).pack(side=tk.LEFT)
         self.save_btn = ttk.Button(bar, text="Save…", command=self.save_file)
         self.save_btn.pack(side=tk.LEFT, padx=4)
-        ttk.Button(bar, text="Designer…", command=self.open_designer).pack(side=tk.LEFT)
+        ttk.Button(bar, text="Designer…", style="Accent.TButton", command=self.open_designer).pack(side=tk.LEFT)
         self.export_btn = ttk.Button(bar, text="Export ground truth…", command=self.export_ground_truth)
-        self.export_btn.pack(side=tk.LEFT, padx=4)
-        self.summary = tk.Text(tf, height=12, width=64, wrap=tk.WORD, font=("TkFixedFont", 9))
-        self.summary.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
-        self.compat_label = ttk.Label(tf, text="", wraplength=520)
+        self.export_btn.pack(side=tk.RIGHT)
+        self.summary = ps.rich_text(tf, height=13, width=60)
+        self.summary.pack(fill=tk.BOTH, expand=True, pady=(8, 4))
+        self.compat_label = ttk.Label(tf, text="", wraplength=560, style="Card.TLabel")
         self.compat_label.pack(fill=tk.X)
 
-        side = ttk.Frame(mid)
-        side.pack(side=tk.LEFT, fill=tk.Y, padx=(6, 0))
-        jf = ttk.LabelFrame(side, text="Microstep jumpers", padding=6)
-        jf.pack(fill=tk.X)
-        row = ttk.Frame(jf)
+        # Right: jumpers and run control.
+        side = ttk.Frame(body)
+        side.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        jf = ps.card(side, "Microstep jumpers", fill=tk.X)
+        row = ttk.Frame(jf, style="Card.TFrame")
         row.pack(fill=tk.X)
-        ttk.Label(row, text="Driver").pack(side=tk.LEFT)
+        ttk.Label(row, text="Driver", style="Card.TLabel").pack(side=tk.LEFT)
         self.driver_var = tk.StringVar(value="DRV8825")
         ttk.Combobox(row, textvariable=self.driver_var, values=list(pc.DRIVERS), state="readonly",
-                     width=10).pack(side=tk.LEFT, padx=4)
+                     width=10).pack(side=tk.LEFT, padx=6)
         self.driver_var.trace_add("write", lambda *_: self._driver_changed())
-        self.jumper_label = ttk.Label(jf, text="", wraplength=300, justify=tk.LEFT)
-        self.jumper_label.pack(fill=tk.X, pady=4)
+        self.jumper_canvas = tk.Canvas(jf, width=300, height=74, background=ps.SURFACE,
+                                       highlightthickness=0)
+        self.jumper_canvas.pack(fill=tk.X, pady=(8, 2))
+        self.jumper_label = ttk.Label(jf, text="", wraplength=300, justify=tk.LEFT, style="Muted.TLabel")
+        self.jumper_label.pack(fill=tk.X, pady=(0, 4))
         self.jumpers_ok = tk.BooleanVar(value=False)
         self.jumper_check = ttk.Checkbutton(jf, text="Jumpers are set as shown", variable=self.jumpers_ok,
                                             command=self._refresh)
         self.jumper_check.pack(anchor="w")
 
-        rf = ttk.LabelFrame(side, text="Run", padding=6)
-        rf.pack(fill=tk.X, pady=(6, 0))
-        g = ttk.Frame(rf)
+        rf = ps.card(side, "Run", fill=tk.X, pady=(8, 0))
+        g = ttk.Frame(rf, style="Card.TFrame")
         g.pack(fill=tk.X)
-        ttk.Label(g, text="Trigger").grid(row=0, column=0, sticky="w")
+        ttk.Label(g, text="Trigger", style="Card.TLabel").grid(row=0, column=0, sticky="w", pady=2)
         self.trigger_label = tk.StringVar(value=TRIGGER_LABELS["ttl"])
         ttk.Combobox(g, textvariable=self.trigger_label, values=list(TRIGGER_LABELS.values()),
-                     state="readonly", width=30).grid(row=0, column=1, sticky="w")
-        self.trigger_warning = ttk.Label(g, text="", foreground="#b06000", wraplength=300)
+                     state="readonly", width=30).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(g, text="Cycles", style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=2)
+        cyc = ttk.Frame(g, style="Card.TFrame")
+        cyc.grid(row=1, column=1, sticky="w", padx=(8, 0))
+        self.cycles_var = tk.StringVar(value="0")
+        ttk.Spinbox(cyc, from_=0, to=1_000_000, textvariable=self.cycles_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(cyc, text="0 = until stopped", style="Muted.TLabel").pack(side=tk.LEFT, padx=6)
+        self.trigger_warning = ttk.Label(g, text="", style="Warn.TLabel", wraplength=300)
         self.trigger_warning.grid(row=2, column=0, columnspan=2, sticky="w")
         self.trigger_label.trace_add("write", lambda *_: self._trigger_changed())
-        ttk.Label(g, text="Cycles (0 = forever)").grid(row=1, column=0, sticky="w")
-        self.cycles_var = tk.StringVar(value="0")
-        ttk.Spinbox(g, from_=0, to=1_000_000, textvariable=self.cycles_var, width=8).grid(
-            row=1, column=1, sticky="w")
-        b = ttk.Frame(rf)
-        b.pack(fill=tk.X, pady=4)
+
+        b = ttk.Frame(rf, style="Card.TFrame")
+        b.pack(fill=tk.X, pady=(8, 4))
+        b.columnconfigure((0, 1), weight=1, uniform="run")
         self.upload_btn = ttk.Button(b, text="Upload", command=self.upload)
-        self.upload_btn.pack(side=tk.LEFT)
-        self.arm_btn = ttk.Button(b, text="Arm / Start", command=self.arm)
-        self.arm_btn.pack(side=tk.LEFT, padx=4)
-        self.finish_btn = ttk.Button(b, text="Finish", command=lambda: self._run("FINISH", lambda d: d.finish()))
-        self.finish_btn.pack(side=tk.LEFT)
-        self.stop_btn = ttk.Button(b, text="STOP", command=self.stop)
-        self.stop_btn.pack(side=tk.LEFT, padx=4)
+        self.upload_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self.arm_btn = ttk.Button(b, text="Arm / Start", style="Accent.TButton", command=self.arm)
+        self.arm_btn.grid(row=0, column=1, sticky="ew", padx=(3, 0))
+        self.finish_btn = ttk.Button(b, text="Finish cycle", command=lambda: self._run("FINISH", lambda d: d.finish()))
+        self.finish_btn.grid(row=1, column=0, sticky="ew", padx=(0, 3), pady=(6, 0))
+        self.stop_btn = ttk.Button(b, text="STOP", style="Big.Danger.TButton", command=self.stop)
+        self.stop_btn.grid(row=1, column=1, sticky="ew", padx=(3, 0), pady=(6, 0))
         self.progress = ttk.Progressbar(rf, mode="determinate")
-        self.progress.pack(fill=tk.X)
-        s = ttk.Frame(rf)
-        s.pack(fill=tk.X, pady=(4, 0))
+        self.progress.pack(fill=tk.X, pady=(4, 2))
+        s = ttk.Frame(rf, style="Card.TFrame")
+        s.pack(fill=tk.X, pady=(2, 0))
         self.status_btn = ttk.Button(s, text="Status", command=self.status)
         self.status_btn.pack(side=tk.LEFT)
-        self.state_label = ttk.Label(s, text="")
-        self.state_label.pack(side=tk.LEFT, padx=6)
-        j = ttk.Frame(rf)
-        j.pack(fill=tk.X, pady=(4, 0))
-        ttk.Label(j, text="Jog steps").pack(side=tk.LEFT)
-        self.jog_steps = tk.StringVar(value="100")
-        ttk.Entry(j, textvariable=self.jog_steps, width=7).pack(side=tk.LEFT)
-        ttk.Label(j, text="Hz").pack(side=tk.LEFT, padx=(4, 0))
-        self.jog_rate = tk.StringVar(value="1000")
-        ttk.Entry(j, textvariable=self.jog_rate, width=6).pack(side=tk.LEFT)
-        self.jog_btn = ttk.Button(j, text="Jog", command=self.jog)
-        self.jog_btn.pack(side=tk.LEFT, padx=4)
-        self.zero_btn = ttk.Button(j, text="Zero", command=lambda: self._run("ZERO", lambda d: d.zero()))
-        self.zero_btn.pack(side=tk.LEFT)
+        self.state_label = ttk.Label(s, text="", style="Muted.TLabel", wraplength=230)
+        self.state_label.pack(side=tk.LEFT, padx=8)
 
-        lf = ttk.LabelFrame(r, text="Log", padding=4)
-        lf.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
-        self.log_text = ScrolledText(lf, height=10, font=("TkFixedFont", 9))
+        mf = ps.card(side, "Manual move", fill=tk.X, pady=(8, 0))
+        j = ttk.Frame(mf, style="Card.TFrame")
+        j.pack(fill=tk.X)
+        ttk.Label(j, text="Steps", style="Card.TLabel").pack(side=tk.LEFT)
+        self.jog_steps = tk.StringVar(value="100")
+        ttk.Entry(j, textvariable=self.jog_steps, width=7).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(j, text="Rate (Hz)", style="Card.TLabel").pack(side=tk.LEFT)
+        self.jog_rate = tk.StringVar(value="1000")
+        ttk.Entry(j, textvariable=self.jog_rate, width=6).pack(side=tk.LEFT, padx=4)
+        self.zero_btn = ttk.Button(j, text="Set zero", command=lambda: self._run("ZERO", lambda d: d.zero()))
+        self.zero_btn.pack(side=tk.RIGHT)
+        self.jog_btn = ttk.Button(j, text="Jog", command=self.jog)
+        self.jog_btn.pack(side=tk.RIGHT, padx=4)
+
+        # Bottom: serial log.
+        lf = ps.card(body, "Log")
+        lf.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        self.log_text = ScrolledText(lf, height=9, font="TkFixedFont", background=ps.CONSOLE_BG,
+                                     foreground=ps.CONSOLE_FG, insertbackground=ps.CONSOLE_FG,
+                                     relief="flat", borderwidth=0, highlightthickness=0, padx=6, pady=4)
         self.log_text.pack(fill=tk.BOTH, expand=True)
+        for tag, color in (("time", "#6b7280"), ("tx", "#93c5fd"), ("rx", "#86efac"), ("ev", "#fcd34d"),
+                           ("err", "#fca5a5")):
+            self.log_text.tag_configure(tag, foreground=color)
+
+    def _draw_jumpers(self, driver: str, microstep: Optional[int]) -> None:
+        """Mode pins as jumper headers: a filled block = jumper fitted (HIGH)."""
+        c = self.jumper_canvas
+        c.delete("all")
+        info = pc.DRIVERS[driver]
+        levels = info["table"].get(microstep) if microstep else None
+        for i, pin in enumerate(info["pins"]):
+            x = 40 + i * 90
+            c.create_text(x + 14, 10, text=pin, fill=ps.MUTED, font=("TkDefaultFont", 9, "bold"))
+            for dy in (0, 22):
+                c.create_oval(x + 8, 22 + dy, x + 20, 34 + dy, outline="#9aa5b1", width=2)
+            if levels is None:
+                continue
+            if levels[i]:
+                c.create_rectangle(x + 2, 18, x + 26, 60, fill=ps.ACCENT, outline=ps.ACCENT_DARK, width=1)
+                c.create_text(x + 14, 39, text="ON", fill="#ffffff", font=("TkDefaultFont", 8, "bold"))
+            c.create_text(x + 14, 68, text="HIGH" if levels[i] else "open",
+                          fill=ps.ACCENT if levels[i] else ps.MUTED, font=("TkDefaultFont", 8))
 
     # -- helpers ------------------------------------------------------------
-    def log(self, text: str) -> None:
-        self.log_text.insert(tk.END, time.strftime("%H:%M:%S ") + text + "\n")
+    def log(self, text: str, tag: Optional[str] = None) -> None:
+        if tag is None:
+            low = text.lower()
+            tag = "err" if ("failed" in low or "error" in low or text.startswith("< ERR")) else ""
+        self.log_text.insert(tk.END, time.strftime("%H:%M:%S "), "time")
+        self.log_text.insert(tk.END, text + "\n", tag)
         self.log_text.see(tk.END)
 
     def _post(self, fn, *args) -> None:
@@ -202,11 +258,12 @@ class PhantomApp:
     def _caps(self) -> Optional[dict]:
         return self.dev.caps if self.dev else None
 
-    def _set_summary(self, text: str) -> None:
-        self.summary.configure(state=tk.NORMAL)
-        self.summary.delete("1.0", tk.END)
-        self.summary.insert("1.0", text)
-        self.summary.configure(state=tk.DISABLED)
+    def _set_state(self, state: str) -> None:
+        """Device state shown in the header badge (offline/idle/loading/ready/armed/running)."""
+        self.dev_state = state
+        labels = {"armed": {"ttl": "ARMED · WAITING FOR TTL", "button": "ARMED · WAITING FOR BUTTON"}
+                  .get(self.trigger, "ARMED")}
+        self.state_badge.set(labels.get(state, state.upper()), state)
 
     def problems(self) -> list[str]:
         """Reasons why the current trajectory cannot be uploaded."""
@@ -222,38 +279,42 @@ class PhantomApp:
         t = self.traj
         probs = self.problems()
         if t is None:
-            self._set_summary("No trajectory. Open a .phtraj file or use the designer.")
+            ps.set_rich(self.summary, [("No trajectory loaded.\n", "head"),
+                                       ("Open a .phtraj file or create one in the designer.", "key")])
             self.jumper_label.configure(text="")
             self.compat_label.configure(text="")
+            self._draw_jumpers(self.driver_var.get(), None)
         else:
             m = t.metrics
-            name = os.path.basename(self.traj_path) if self.traj_path else "(from designer)"
-            per = ", ".join(f"{p.length_ms:.0f} ms/{p.amplitude_deg:.1f}°" for p in t.periods)
-            lines = [
-                f"File      {name}",
-                f"Shape     {t.design.shape}, skew {t.design.skew:+.2f}, {len(t.periods)} period(s): {per}",
-                f"Cycle     {t.cycle_s * 1000:.3f} ms, {m.get('steps_per_cycle', '?')} steps",
-                f"Microstep 1/{t.microstep}   tick {t.tick_hz:,} Hz   driver {t.driver}",
-                f"Segments  {len(t.segments)} ({m.get('memory_bytes', '?')} bytes), "
-                f"checksum {t.checksum}",
-                f"Speed     peak {m.get('peak_speed_dps', 0):.1f} deg/s, "
-                f"step rate {m.get('peak_step_rate_hz', 0):.0f} Hz",
-                f"Errors    timing <= {m.get('max_timing_error_us', 0):.2f} µs, "
-                f"position <= {m.get('max_position_error_deg', 0):.4f} deg",
-                f"Compiled for {t.device_caps.get('board', '?')}",
-            ]
-            lines += [f"WARNING: {w}" for w in t.warnings]
-            self._set_summary("\n".join(lines))
+            name = os.path.basename(self.traj_path) if self.traj_path else "from the designer"
+            per = ", ".join(f"{p.length_ms:.0f} ms / {p.amplitude_deg:.1f}°" for p in t.periods)
+            parts = [(f"{t.design.shape.capitalize()} · {len(t.periods)} period(s)\n", "head")]
+            ps.kv(parts, "File", name)
+            ps.kv(parts, "Periods", f"{per}, skew {t.design.skew:+.2f}")
+            ps.kv(parts, "Cycle", f"{t.cycle_s * 1000:.3f} ms · {m.get('steps_per_cycle', '?')} steps")
+            ps.kv(parts, "Microstep", f"1/{t.microstep} · tick {t.tick_hz:,} Hz · {t.driver}")
+            ps.kv(parts, "Segments", f"{len(t.segments)} ({m.get('memory_bytes', '?')} bytes) · "
+                                     f"checksum {t.checksum}")
+            ps.kv(parts, "Peak speed", f"{m.get('peak_speed_dps', 0):.1f} deg/s · "
+                                       f"{m.get('peak_step_rate_hz', 0):.0f} steps/s")
+            ps.kv(parts, "Max errors", f"timing {m.get('max_timing_error_us', 0):.2f} µs · "
+                                       f"position {m.get('max_position_error_deg', 0):.4f} deg")
+            ps.kv(parts, "Compiled for", t.device_caps.get("board", "?"))
+            parts += [(f"Warning: {w}\n", "warn") for w in t.warnings]
+            ps.set_rich(self.summary, parts)
             try:
                 self.jumper_label.configure(text=pc.jumper_instructions(self.driver_var.get(), t.microstep))
+                self._draw_jumpers(self.driver_var.get(), t.microstep)
             except ValueError as exc:
                 self.jumper_label.configure(text=str(exc))
+                self._draw_jumpers(self.driver_var.get(), None)
             if probs:
-                self.compat_label.configure(text="NOT COMPATIBLE: " + "; ".join(probs), foreground="#b00020")
+                self.compat_label.configure(text="NOT COMPATIBLE: " + "; ".join(probs), style="Error.TLabel")
             elif connected:
-                self.compat_label.configure(text="Compatible with the connected device", foreground="#1b7f1b")
+                self.compat_label.configure(text="Compatible with the connected device", style="Ok.TLabel")
             else:
-                self.compat_label.configure(text="connect a device to check compatibility", foreground="#888")
+                self.compat_label.configure(text="Connect a device to check compatibility",
+                                            style="Muted.TLabel")
 
         can_upload = connected and not probs and self.jumpers_ok.get() and not self.running
         on_device = t is not None and self.uploaded_checksum == t.checksum
@@ -265,7 +326,12 @@ class PhantomApp:
             btn.configure(state=tk.NORMAL if connected and not self.running else tk.DISABLED)
         for btn in (self.save_btn, self.export_btn):
             btn.configure(state=tk.NORMAL if t is not None else tk.DISABLED)
-        self.connect_btn.configure(text="Disconnect" if connected else "Connect")
+        self.connect_btn.configure(text="Disconnect" if connected else "Connect",
+                                   style="TButton" if connected else "Accent.TButton")
+        if not connected:
+            self._set_state("offline")
+        elif self.dev_state == "offline":
+            self._set_state("idle")
 
     # -- trajectory ---------------------------------------------------------
     def set_trajectory(self, traj: pc.CompiledTrajectory, path: Optional[str] = None) -> None:
@@ -354,8 +420,8 @@ class PhantomApp:
         c = dev.caps
         self.dev_label.configure(
             text=f"{c['fw']} {c['version']} on {c['board']} · {c['max_segments']} segments · "
-                 f"max {c['max_step_rate_hz']} steps/s · TTL {'yes' if c.get('ttl') else 'no'}",
-            foreground="#1b7f1b")
+                 f"max {c['max_step_rate_hz']} steps/s · TTL {'yes' if c.get('ttl') else 'no'}")
+        self._set_state("idle")
         self._refresh()
 
     def disconnect(self) -> None:
@@ -364,20 +430,24 @@ class PhantomApp:
         self.dev = None
         self.uploaded_checksum = None
         self.running = False
-        self.dev_label.configure(text="not connected", foreground="#888")
+        self.dev_label.configure(text="not connected")
         self.state_label.configure(text="")
         self._refresh()
 
     def _on_line(self, direction: str, line: str) -> None:
-        self.log(f"{direction} {line}")
+        tag = "tx" if direction == ">" else ("err" if line.startswith("ERR") else
+                                             ("ev" if line.startswith("EV") else "rx"))
+        self.log(f"{direction} {line}", tag)
 
     def _on_event(self, line: str) -> None:
         if line.startswith("EV START"):
             self.running = True
             self.state_label.configure(text="running")
+            self._set_state("running")
         elif line.startswith("EV DONE"):
             self.running = False
             self.state_label.configure(text="done: " + line[8:])
+            self._set_state("ready")
         self._refresh()
 
     def _run(self, label: str, fn, done=None) -> None:
@@ -391,15 +461,21 @@ class PhantomApp:
                 result = fn(dev)
                 self._post(lambda: done(result) if done else None)
             except (DeviceError, OSError, ValueError) as exc:
-                self._post(self.log, f"{label} failed: {exc}")
+                self._post(self.log, f"{label} failed: {exc}", "err")
+                if label == "upload":
+                    self._post(self._set_state, "idle")
                 self._post(self._refresh)
 
         threading.Thread(target=work, daemon=True).start()
 
     def status(self) -> None:
-        self._run("STATUS", lambda d: d.status(), lambda st: self.state_label.configure(
-            text=f"{st.get('state')} · cycle {st.get('cycle')} · pos {st.get('pos')} · "
-                 f"overruns {st.get('overruns')}"))
+        def done(st):
+            self.state_label.configure(text=f"cycle {st.get('cycle')} · pos {st.get('pos')} · "
+                                            f"overruns {st.get('overruns')}")
+            if st.get("state") in ps.STATE_COLORS:
+                self._set_state(st["state"])
+
+        self._run("STATUS", lambda d: d.status(), done)
 
     def _cycles(self) -> int:
         try:
@@ -417,6 +493,7 @@ class PhantomApp:
         self.progress.configure(maximum=len(traj.segments), value=0)
         self.uploaded_checksum = None  # LOAD invalidates the program on the device
         self.upload_btn.configure(state=tk.DISABLED)
+        self._set_state("loading")
         self.log(f"uploading {len(traj.segments)} segments (trigger {trigger}, cycles {cycles}) …")
 
         def prog(i, n):
@@ -424,7 +501,8 @@ class PhantomApp:
 
         def done(_):
             self.uploaded_checksum = traj.checksum
-            self.log("upload complete, checksum verified by the device")
+            self.log("upload complete, checksum verified by the device", "ev")
+            self._set_state("ready")
             self._refresh()
 
         self._run("upload", lambda d: d.upload(traj, cycles, trigger, prog), done)
@@ -434,15 +512,19 @@ class PhantomApp:
             messagebox.showwarning("Jumpers", "Confirm the jumper settings first.", parent=self.root)
             return
         trigger, cycles = self.trigger, self._cycles()
-        self._run("ARM", lambda d: d.arm(trigger, cycles),
-                  lambda line: self.state_label.configure(
-                      text={"ttl": "armed, waiting for the MRI TTL", "button": "armed, waiting for the button",
-                            "now": "starting"}[trigger]))
+        def done(_):
+            self.state_label.configure(text={"ttl": "waiting for the MRI TTL", "button": "waiting for the button",
+                                             "now": "starting"}[trigger])
+            if self.dev_state != "running":
+                self._set_state("armed")
+
+        self._run("ARM", lambda d: d.arm(trigger, cycles), done)
 
     def stop(self) -> None:
         def done(pos):
             self.running = False
             self.state_label.configure(text=f"stopped at {pos} steps")
+            self._set_state("ready" if self.uploaded_checksum is not None else "idle")
             self._refresh()
 
         self._run("STOP", lambda d: d.stop(), done)

@@ -129,6 +129,21 @@ flowchart LR
   WAIT segments are pure delays (dwell, long gaps). `frac` resets every cycle,
   so all cycles are identical and the cycle length is exact in ticks.
 
+## The two windows
+
+The **designer** shapes the motion and compiles it for a device. Each period is
+a band (P1, P2, …), the error panel shows the step quantization envelope
+against ±1 microstep, and the dashed lines in the speed panel are the speed
+limit. The Result tab shows what the planner chose and what else it tried.
+
+![Trajectory designer](img/gui_designer.png)
+
+The **controller** window connects to the board, shows the jumper setting for
+the chosen microstep as a header diagram, uploads, arms and stops. The badge
+top right is the device state (offline, idle, loading, ready, armed, running).
+
+![Controller window](img/gui_main.png)
+
 ## Inside the controller
 
 ```mermaid
@@ -163,8 +178,13 @@ the emulator test checks it against the measured STEP edges (< 1 µs).
 | STEP pulse width | ~23 µs (drivers need ≥ 1.9 µs) |
 | Segment memory | 72 segments (one smooth period at 1/32 ≈ 30–70) |
 
+The ESP32-S3 back end passes the same end-to-end tests in a host simulation
+(steps exactly on plan, no jitter in the model). Its interrupt latencies are
+modelled, not measured.
+
 Still to validate on real hardware: STEP/DIR with a logic analyser against the
-plan, the driver current limit (lost steps are mechanical), and the ESP32 build.
+plan, the driver current limit (lost steps are mechanical), and the ESP32
+timing (trigger latency).
 
 ## Where to look
 

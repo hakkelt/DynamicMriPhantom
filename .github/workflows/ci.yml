@@ -6,7 +6,7 @@ on:
 
 jobs:
   test:
-    name: Python, host engine, AVR emulator and GUI tests
+    name: Python, host engine, AVR + ESP32 emulator and GUI tests
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +34,9 @@ jobs:
       # avr-libc 2.0.0 has incomplete ATmega328PB headers.
       - name: Build firmware (ATmega328P for the emulator)
         run: emulator/build_avr.sh atmega328p
+
+      - name: Build the ESP32-S3 host emulator
+        run: emulator/build_esp32.sh
 
       - name: Run tests
         env:

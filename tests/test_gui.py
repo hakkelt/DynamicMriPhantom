@@ -72,6 +72,7 @@ def test_designer_compile_and_send(app, shots, tmp_path):
     assert res.trajectory is not None
     pump(app.root, timeout=1.0)
     text = win.result.get("1.0", "end")
+    assert "Tried" in text
     assert "Microstep 1/" in text and "Set M0/M1/M2" in text
     assert len(win.ax_pos.lines) == 2
     img, ncolors = screenshot(win, os.path.join(shots, "designer.png"))
@@ -80,7 +81,7 @@ def test_designer_compile_and_send(app, shots, tmp_path):
     win.send()
     pump(app.root)
     assert app.traj is res.trajectory
-    assert "Microstep 1/" in app.summary.get("1.0", "end")
+    assert "Microstep\t1/" in app.summary.get("1.0", "end")
     assert str(app.upload_btn["state"]) == "disabled"  # not connected, jumpers not confirmed
     path = str(tmp_path / "x.phtraj")
     app.traj.save(path)
@@ -109,7 +110,7 @@ def test_upload_and_run_on_emulator(app, shots, hex_path):
                                  pc.Limits(), app.dev.caps)
         app.set_trajectory(traj)
         pump(app.root)
-        assert str(app.compat_label["text"]).startswith("Compatible")
+        assert "Compatible with" in str(app.compat_label["text"])
         assert str(app.upload_btn["state"]) == "disabled"  # jumpers not confirmed yet
         app.jumpers_ok.set(True)
         app._refresh()

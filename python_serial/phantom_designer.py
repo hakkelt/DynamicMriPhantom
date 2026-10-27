@@ -14,7 +14,6 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from tkinter.scrolledtext import ScrolledText
 from typing import Callable, Optional
 
 import matplotlib
@@ -23,11 +22,13 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 
+import numpy as np  # noqa: E402
+
 import phantom_core as pc  # noqa: E402
+import phantom_style as ps  # noqa: E402
 
 TARGET_DEVICE = "Connected device"
 TARGETS = {"ATmega328PB (default caps)": "atmega328pb", "ESP32-S3 (default caps)": "esp32s3"}
-IDEAL_COLOR, REAL_COLOR, INK_COLOR = "#2a78d6", "#eb6834", "#52514e"
 ALL_MICROSTEPS = sorted(set().union(*(d["table"] for d in pc.DRIVERS.values())))
 
 
@@ -42,7 +43,8 @@ class DesignerWindow(tk.Toplevel):
                  initial: Optional[pc.CompiledTrajectory] = None):
         super().__init__(master)
         self.title("Trajectory designer")
-        self.geometry("1280x820")
+        self.geometry("1320x860")
+        ps.apply_theme(self)
         self.on_send = on_send
         self.get_caps = get_caps or (lambda: None)
         self.traj: Optional[pc.CompiledTrajectory] = None
@@ -57,23 +59,21 @@ class DesignerWindow(tk.Toplevel):
     # -- layout -------------------------------------------------------------
     def _build(self) -> None:
         pw = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
-        pw.pack(fill=tk.BOTH, expand=True)
-        left = ttk.Frame(pw, padding=6)
-        right = ttk.Frame(pw)
+        pw.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        left = ttk.Frame(pw, padding=(0, 0, 6, 0))
+        right = ttk.Frame(pw, style="Card.TFrame", padding=4)
         pw.add(left, weight=0)
         pw.add(right, weight=1)
 
         d, lim = pc.Design(), pc.Limits()
-        shape = ttk.LabelFrame(left, text="Shape", padding=4)
-        shape.pack(fill=tk.X)
+        shape = ps.card(left, "Shape", fill=tk.X)
         self._combo(shape, "shape", "Shape", pc.SHAPES, d.shape, 0)
         self._entry(shape, "amplitude_deg", "Amplitude (deg)", d.amplitude_deg, 1)
         self._entry(shape, "length_ms", "Period length (ms)", d.length_ms, 2)
         self._entry(shape, "skew", "Skewness (-0.95..0.95)", d.skew, 3)
         self._entry(shape, "delay_ms", "Delay between periods (ms)", d.delay_ms, 4)
 
-        irr = ttk.LabelFrame(left, text="Irregularity", padding=4)
-        irr.pack(fill=tk.X, pady=(6, 0))
+        irr = ps.card(left, "Irregularity (K distinct periods, repeated)", fill=tk.X, pady=(6, 0))
         self._spin(irr, "n_periods", "Distinct periods K", d.n_periods, 1, 5, 0)
         self._entry(irr, "length_spread_pct", "Length spread (%)", d.length_spread_pct, 1)
         self._entry(irr, "amplitude_spread_pct", "Amplitude spread (%)", d.amplitude_spread_pct, 2)
@@ -82,12 +82,11 @@ class DesignerWindow(tk.Toplevel):
         self._entry(irr, "seed", "Seed", d.seed, 5)
         ttk.Button(irr, text="New seed", command=self._new_seed).grid(row=5, column=2, padx=2)
 
-        drv = ttk.LabelFrame(left, text="Driver and limits", padding=4)
-        drv.pack(fill=tk.X, pady=(6, 0))
+        drv = ps.card(left, "Driver and limits", fill=tk.X, pady=(6, 0))
         self._combo(drv, "driver", "Driver", tuple(pc.DRIVERS), lim.driver, 0)
-        msf = ttk.Frame(drv)
-        msf.grid(row=1, column=0, columnspan=3, sticky="w")
-        ttk.Label(msf, text="Allowed microsteps:").pack(side=tk.LEFT)
+        ttk.Label(drv, text="Microsteps", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 6))
+        msf = ttk.Frame(drv, style="Card.TFrame")
+        msf.grid(row=1, column=1, columnspan=2, sticky="w", pady=2)
         self._ms_checks = {}
         for m in ALL_MICROSTEPS:
             v = tk.BooleanVar(value=True)
@@ -105,37 +104,52 @@ class DesignerWindow(tk.Toplevel):
         self._driver_changed()
 
         btns = ttk.Frame(left)
-        btns.pack(fill=tk.X, pady=6)
-        self.compile_btn = ttk.Button(btns, text="Compile", command=self.compile)
+        btns.pack(fill=tk.X, pady=8)
+        self.compile_btn = ttk.Button(btns, text="Compile", style="Big.Accent.TButton", command=self.compile)
         self.compile_btn.pack(side=tk.LEFT)
         self.save_btn = ttk.Button(btns, text="Save…", command=self.save, state=tk.DISABLED)
         self.save_btn.pack(side=tk.LEFT, padx=4)
-        self.send_btn = ttk.Button(btns, text="Send to main window", command=self.send, state=tk.DISABLED)
+        self.send_btn = ttk.Button(btns, text="Use in main window →", command=self.send, state=tk.DISABLED)
         self.send_btn.pack(side=tk.LEFT)
         if self.on_send is None:
             self.send_btn.pack_forget()
 
-        tab = ttk.LabelFrame(left, text="Period table", padding=4)
-        tab.pack(fill=tk.X)
+        self.tabs = ttk.Notebook(left)
+        self.tabs.pack(fill=tk.BOTH, expand=True)
+        res = ttk.Frame(self.tabs, style="Card.TFrame", padding=8)
+        tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=8)
+        self.tabs.add(res, text="Result")
+        self.tabs.add(tab, text="Periods")
         cols = ("k", "length_ms", "amplitude_deg", "skew", "delay_ms")
+        heads = ("#", "Length (ms)", "Amplitude (°)", "Skew", "Delay (ms)")
         self.table = ttk.Treeview(tab, columns=cols, show="headings", height=5)
-        for c, w in zip(cols, (30, 80, 90, 60, 70)):
-            self.table.heading(c, text=c)
+        for c, h, w in zip(cols, heads, (30, 90, 100, 60, 80)):
+            self.table.heading(c, text=h)
             self.table.column(c, width=w, anchor=tk.E)
-        self.table.pack(fill=tk.X)
+        self.table.pack(fill=tk.BOTH, expand=True)
 
-        self.result = ScrolledText(left, width=58, height=14, wrap=tk.WORD, font=("TkFixedFont", 9))
+        self.result = ps.rich_text(res, width=58, height=10)
+        sb = ttk.Scrollbar(res, orient=tk.VERTICAL, command=self.result.yview)
+        self.result.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.result.pack(fill=tk.BOTH, expand=True)
-        self.result.insert("1.0", "Set the parameters and press Compile.")
-        self.result.configure(state=tk.DISABLED)
+        ps.set_rich(self.result, [("Set the parameters and press Compile.", "key")])
 
         self.fig = Figure(figsize=(8, 7.5), dpi=90, layout="constrained")
+        ps.style_figure(self.fig)
         self.ax_pos = self.fig.add_subplot(4, 1, 1)
         self.ax_err = self.fig.add_subplot(4, 1, 2, sharex=self.ax_pos)
         self.ax_spd = self.fig.add_subplot(4, 1, 3, sharex=self.ax_pos)
         self.ax_rate = self.fig.add_subplot(4, 1, 4, sharex=self.ax_pos)
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
-        NavigationToolbar2Tk(self.canvas, right).update()
+        tb = NavigationToolbar2Tk(self.canvas, right)
+        tb.configure(background=ps.SURFACE)
+        for child in tb.winfo_children():
+            try:
+                child.configure(background=ps.SURFACE)
+            except tk.TclError:
+                pass
+        tb.update()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self._clear_plots()
 
@@ -144,7 +158,7 @@ class DesignerWindow(tk.Toplevel):
             self._vars[key].trace_add("write", lambda *_: self._update_periods())
 
     def _label(self, parent, text, row):
-        ttk.Label(parent, text=text).grid(row=row, column=0, sticky="w", padx=(0, 6))
+        ttk.Label(parent, text=text, style="Card.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 6), pady=2)
 
     def _entry(self, parent, key, text, value, row):
         self._label(parent, text, row)
@@ -299,57 +313,95 @@ class DesignerWindow(tk.Toplevel):
             self._clear_plots()
 
     def _show_result(self, res: pc.PlanResult) -> None:
-        lines = []
         t = res.trajectory
         if t is None:
-            lines.append(f"FAILED: {res.error}")
+            parts = [("Does not fit the device\n", "head"), (f"{res.error}\n", "error")]
         else:
             m = t.metrics
-            lines += [
-                f"Microstep 1/{t.microstep}   tick {t.tick_hz:,} Hz   "
-                f"({1e6 / t.tick_hz:.4g} µs)",
-                pc.jumper_instructions(t.driver, t.microstep),
-                f"Segments {m['n_segments']} / {t.device_caps['max_segments']}  "
-                f"({m['memory_bytes']} bytes)",
-                f"Cycle {m['cycle_s'] * 1000:.3f} ms, {m['steps_per_cycle']} steps",
-                f"Peak speed {m['peak_speed_dps']:.1f} deg/s, accel {m['peak_accel_dps2']:.0f} deg/s²",
-                f"Peak step rate {m['peak_step_rate_hz']:.0f} Hz "
-                f"(device max {t.device_caps['max_step_rate_hz']})",
-                f"Start/stop speed {m['max_start_stop_speed_dps']:.1f} deg/s",
-                f"Max timing error {m['max_timing_error_us']:.2f} µs",
-                f"Max position error {m['max_position_error_deg']:.4f} deg",
-            ]
-            if t.warnings:
-                lines.append("")
-                lines += [f"WARNING: {w}" for w in t.warnings]
-        lines.append("")
-        lines.append("Tried:")
+            cap = t.device_caps
+            parts = [(f"Microstep 1/{t.microstep} · tick {t.tick_hz:,} Hz ({1e6 / t.tick_hz:.4g} µs)\n", "head"),
+                     (pc.jumper_instructions(t.driver, t.microstep) + "\n", "key")]
+            ps.kv(parts, "Segments", f"{m['n_segments']} / {cap['max_segments']}  ({m['memory_bytes']} bytes)")
+            ps.kv(parts, "Cycle", f"{m['cycle_s'] * 1000:.3f} ms, {m['steps_per_cycle']} steps")
+            ps.kv(parts, "Peak speed", f"{m['peak_speed_dps']:.1f} deg/s")
+            ps.kv(parts, "Peak accel", f"{m['peak_accel_dps2']:.0f} deg/s²")
+            ps.kv(parts, "Peak step rate", f"{m['peak_step_rate_hz']:.0f} Hz (device max {cap['max_step_rate_hz']})")
+            ps.kv(parts, "Start/stop speed", f"{m['max_start_stop_speed_dps']:.1f} deg/s")
+            ps.kv(parts, "Timing error", f"≤ {m['max_timing_error_us']:.2f} µs")
+            ps.kv(parts, "Position error", f"≤ {m['max_position_error_deg']:.4f} deg")
+            parts += [(f"Warning: {w}\n", "warn") for w in t.warnings]
+        parts.append(("Tried (largest microstep, finest tick first)\n", "head"))
         for a in res.attempts:
             tick = f"{a['tick_hz']:,} Hz" if a["tick_hz"] else "-"
-            lines.append(f"  1/{a['microstep']:<3} {tick:>14}: {a['result']}")
-        self.result.configure(state=tk.NORMAL)
-        self.result.delete("1.0", tk.END)
-        self.result.insert("1.0", "\n".join(lines))
-        self.result.configure(state=tk.DISABLED)
+            parts.append((f"1/{a['microstep']:<3}{tick:>14}  {a['result']}\n", "mono"))
+        ps.set_rich(self.result, parts)
 
     def _clear_plots(self) -> None:
         for ax in (self.ax_pos, self.ax_err, self.ax_spd, self.ax_rate):
             ax.clear()
+            ps.style_axes(ax)
+        for ax in (self.ax_pos, self.ax_err, self.ax_spd):
+            ax.tick_params(labelbottom=False)
         self.ax_pos.set_ylabel("position (deg)")
         self.ax_err.set_ylabel("real − ideal (deg)")
-        self.ax_spd.set_ylabel("ideal speed (deg/s)")
+        self.ax_spd.set_ylabel("speed (deg/s)")
         self.ax_rate.set_ylabel("step rate (Hz)")
         self.ax_rate.set_xlabel("time from the TTL edge (s)")
         self.canvas.draw_idle()
 
+    def _period_bands(self, t_end: float) -> None:
+        """Alternating background bands, one per period (motion + delay), numbered on top."""
+        if self.traj is None:
+            return
+        starts = pc.period_starts(self.traj.periods)
+        k = 0
+        while starts[0] + k * starts[-1] < t_end:
+            off = k * starts[-1]
+            for i in range(len(starts) - 1):
+                a, b = starts[i] + off, starts[i + 1] + off
+                if a >= t_end:
+                    break
+                for ax in (self.ax_pos, self.ax_err, self.ax_spd, self.ax_rate):
+                    ax.axvspan(a, b, color=ps.BAND_COLORS[i % 2], lw=0, zorder=0)
+                self.ax_pos.annotate(f"P{i + 1}", ((a + b) / 2, 1.0), xycoords=("data", "axes fraction"),
+                                     ha="center", va="bottom", fontsize=8, color=ps.MUTED)
+            k += 1
+
     def _plot(self, c) -> None:
         self._clear_plots()
-        self.ax_pos.plot(c["t"], c["ideal_deg"], color=IDEAL_COLOR, lw=1.5, label="ideal")
-        self.ax_pos.step(c["t"], c["real_deg"], where="post", color=REAL_COLOR, lw=0.8, label="real (steps)")
-        self.ax_pos.legend(loc="upper right", fontsize=8)
-        self.ax_err.plot(c["t"], c["error_deg"], color=INK_COLOR, lw=0.6)
-        self.ax_spd.plot(c["t"], c["speed_dps"], color=IDEAL_COLOR, lw=1.2)
-        self.ax_rate.plot(c["rate_t"], c["step_rate_hz"], ".", ms=1.5, color=REAL_COLOR)
+        t = c["t"]
+        self._period_bands(t[-1] if len(t) else 0)
+        self.ax_pos.plot(t, c["ideal_deg"], color=ps.IDEAL_COLOR, lw=1.6, label="ideal")
+        self.ax_pos.step(t, c["real_deg"], where="post", color=ps.REAL_COLOR, lw=0.9, label="real (steps)")
+        self.ax_pos.legend(loc="upper right", fontsize=8, frameon=False)
+        # The error is a fast sawtooth: draw its envelope as a band.
+        err = c["error_deg"]
+        if len(t) > 1:
+            edges = np.linspace(t[0], t[-1], 600)
+            idx = np.clip(np.searchsorted(edges, t) - 1, 0, len(edges) - 2)
+            lo = np.full(len(edges) - 1, np.nan)
+            hi = np.full(len(edges) - 1, np.nan)
+            np.fmin.at(lo, idx, err)
+            np.fmax.at(hi, idx, err)
+            mid = (edges[:-1] + edges[1:]) / 2
+            self.ax_err.fill_between(mid, lo, hi, color=ps.REAL_COLOR, alpha=0.35, lw=0, label="envelope")
+            if self.traj is not None:
+                half = pc.deg_per_step(self.traj.microstep)
+                for y in (-half, half):
+                    self.ax_err.axhline(y, color=ps.LIMIT_COLOR, lw=0.8, ls="--")
+                self.ax_err.annotate("± 1 microstep", (1.0, half), xycoords=("axes fraction", "data"),
+                                     ha="right", va="bottom", fontsize=7, color=ps.MUTED)
+        self.ax_spd.plot(t, c["speed_dps"], color=ps.IDEAL_COLOR, lw=1.3)
+        if self.traj is not None:
+            vmax = self.traj.limits.max_speed_dps
+            for y in (-vmax, vmax):
+                self.ax_spd.axhline(y, color=ps.LIMIT_COLOR, lw=0.8, ls="--")
+            peak = np.abs(c["speed_dps"]).max() if len(t) else 0
+            self.ax_spd.set_ylim(-max(peak, 1) * 1.25, max(peak, 1) * 1.25)
+            if vmax <= peak * 1.25:
+                self.ax_spd.annotate("speed limit", (1.0, vmax), xycoords=("axes fraction", "data"),
+                                     ha="right", va="bottom", fontsize=7, color=ps.MUTED)
+        self.ax_rate.plot(c["rate_t"], c["step_rate_hz"], ".", ms=2, color=ps.REAL_COLOR)
         self.canvas.draw_idle()
 
     # -- output -------------------------------------------------------------

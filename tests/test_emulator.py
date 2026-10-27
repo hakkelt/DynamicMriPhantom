@@ -1,8 +1,12 @@
-"""End-to-end: the real firmware (built for ATmega328P) running in avr8js.
+"""End-to-end: the real firmware on both emulated boards.
 
-Checks every STEP/DIR edge against the plan computed in Python. Skipped when
-node + avr8js (emulator/avr/node_modules) or the firmware hex are missing;
-the hex is built on demand if avr-g++ is available.
+* atmega328p: the firmware hex in avr8js (cycle accurate). Skipped when node +
+  avr8js (emulator/avr/node_modules) or the hex are missing; the hex is built
+  on demand if avr-g++ is available.
+* esp32s3: the firmware's ESP32 code path compiled for the host against a
+  simulated gptimer/GPIO (built on demand with g++).
+
+Checks every STEP/DIR edge against the plan computed in Python.
 """
 import time
 
@@ -15,12 +19,15 @@ from phantom_device import DeviceError, PhantomDevice
 
 pytestmark = pytest.mark.emulator
 
-CYC_PER_US = emumod.F_CPU / 1e6
+BOARDS = ["atmega328p", "esp32s3"]
 
 
-@pytest.fixture
-def rig(hex_path):
-    emu = emumod.AvrEmulator(hex_path).start()
+@pytest.fixture(params=BOARDS)
+def rig(request):
+    if request.param == "esp32s3":
+        emu = emumod.Esp32Emulator(request.getfixturevalue("esp32_bin")).start()
+    else:
+        emu = emumod.AvrEmulator(request.getfixturevalue("hex_path")).start()
     events = []
     dev = PhantomDevice(emu.url, timeout=10, boot_wait=2, on_event=events.append)
     dev.open()
@@ -38,23 +45,25 @@ def compile_for(dev, **kw):
     return pc.compile_design(design, pc.Limits(), dev.caps)
 
 
-def expected_steps(traj, cycles):
+def expected_steps(emu, traj, cycles):
+    """Firmware step times (emulator CPU cycles from the start) and DIR levels."""
     times, kinds, dirs = pc.simulate_engine(traj.segments, cycles)
     st = times[kinds == pc.EV_STEP]
-    return st * (emumod.F_CPU / traj.tick_hz), dirs[kinds == pc.EV_STEP]
+    return st * (emu.f_cpu / traj.tick_hz), dirs[kinds == pc.EV_STEP]
 
 
-def check_waveform(trace, traj, cycles, t0_cycle):
+def check_waveform(emu, trace, traj, cycles, t0_cycle):
+    cyc_per_us = emu.f_cpu / 1e6
     rise = edges(trace, "step", 1)
     fall = edges(trace, "step", 0)
-    exp_t, exp_d = expected_steps(traj, cycles)
+    exp_t, exp_d = expected_steps(emu, traj, cycles)
     assert len(rise) == len(exp_t), "step count"
-    offset_us = (rise - t0_cycle - exp_t) / CYC_PER_US
+    offset_us = (rise - t0_cycle - exp_t) / cyc_per_us
     # constant trigger latency, sub-microsecond jitter, nothing accumulates
     assert 0 < offset_us.min() and offset_us.max() < 10, offset_us
     assert offset_us.max() - offset_us.min() < 1.0, offset_us.max() - offset_us.min()
     # pulse width (DRV8825 >= 1.9 us, A4988 >= 1 us)
-    width_us = (fall[: len(rise)] - rise) / CYC_PER_US
+    width_us = (fall[: len(rise)] - rise) / cyc_per_us
     assert width_us.min() >= 2.0
     # DIR level at every step, and set up before it
     dchg = [(c, v) for c, p, v in trace if p == "dir"]
@@ -63,15 +72,18 @@ def check_waveform(trace, traj, cycles, t0_cycle):
     idx = np.searchsorted(dc, rise, side="right") - 1
     level = np.where(idx >= 0, dv[np.clip(idx, 0, None)], 0)
     assert np.array_equal(level, exp_d)
-    setup_us = (rise - dc[np.clip(idx, 0, None)]) / CYC_PER_US
+    setup_us = (rise - dc[np.clip(idx, 0, None)]) / cyc_per_us
     assert setup_us[idx >= 0].min() >= 1.0
     return offset_us
 
 
 def test_caps_match_python_defaults(rig):
-    _, dev = rig
+    emu, dev = rig
     caps = dev.caps
-    ref = {**pc.DEFAULT_CAPS["atmega328pb"], "board": "atmega328p"}  # emulator runs a 328P build
+    if emu.board == "esp32s3":
+        ref = pc.DEFAULT_CAPS["esp32s3"]
+    else:
+        ref = {**pc.DEFAULT_CAPS["atmega328pb"], "board": "atmega328p"}  # emulator runs a 328P build
     assert caps == ref
     assert caps["seg_bytes"] == pc.SEGMENT_BYTES
 
@@ -91,15 +103,19 @@ def test_ttl_triggered_playback(rig):
     trace = emu.trace()
     mri = edges(trace, "mri", 1)
     assert mri[0] == t0
-    off = check_waveform(trace, traj, 2, mri[0])
+    off = check_waveform(emu, trace, traj, 2, mri[0])
+    if emu.board == "atmega328p":  # cycle accurate: CAPS must state the real latency
+        assert off.max() <= dev.caps["trigger_latency_us"] + 1.0
     # the exported ground truth (time since the TTL edge) is what the motor did
     gt_t, _ = pc.ground_truth(traj)
-    measured = (edges(trace, "step", 1)[:len(gt_t)] - mri[0]) / emumod.F_CPU
-    assert np.abs(measured - gt_t).max() * 1e6 < 1.0
+    measured = (edges(trace, "step", 1)[:len(gt_t)] - mri[0]) / emu.f_cpu
+    # (the ESP32 interrupt latency is a model, not cycle accurate: allow 2 us)
+    assert np.abs(measured - gt_t).max() * 1e6 < (1.0 if emu.board == "atmega328p" else 2.0)
     # the second cycle starts exactly one sequence length later
     n = len(traj.step_targets()[0])
     rise = edges(trace, "step", 1)
-    assert abs((rise[n] - rise[0]) - (expected_steps(traj, 2)[0][n] - expected_steps(traj, 2)[0][0])) < 32
+    exp2 = expected_steps(emu, traj, 2)[0]
+    assert abs((rise[n] - rise[0]) - (exp2[n] - exp2[0])) < 2e-6 * emu.f_cpu
     print(f"trigger latency {off.mean():.2f} us, jitter {off.max() - off.min():.3f} us")
 
 
@@ -118,11 +134,11 @@ def test_immediate_start_shapes(rig, shape, board_tick):
     assert "overruns=0" in done and "pos=0" in done
     trace = emu.trace()
     rise = edges(trace, "step", 1)
-    exp_t, _ = expected_steps(traj, 2)
+    exp_t, _ = expected_steps(emu, traj, 2)
     # find the start from the first step and check the rest relative to it
     t0 = rise[0] - exp_t[0]
     assert t0 > t_arm
-    rel = (rise - t0 - exp_t) / CYC_PER_US
+    rel = (rise - t0 - exp_t) / (emu.f_cpu / 1e6)
     assert np.abs(rel).max() < 1.0
 
 
@@ -135,7 +151,7 @@ def test_only_first_ttl_counts(rig):
     time.sleep(0.1)
     emu.ttl()  # must not restart the sequence
     dev.wait_event("EV DONE", timeout=60)
-    check_waveform(emu.trace(), traj, 1, t0)
+    check_waveform(emu, emu.trace(), traj, 1, t0)
 
 
 def test_button_trigger(rig):
@@ -178,13 +194,15 @@ def test_finish_stops_at_cycle_end_and_stop_is_immediate(rig):
 
 def test_long_wait_last_chunk_not_missed(rig):
     """A delay of 2*0xC000+5 ticks used to end with a 5-tick timer chunk that
-    was already in the past, so the step came one 16-bit timer wrap late."""
+    was already in the past, so the step came one 16-bit timer wrap late (AVR);
+    on the ESP32 it is just a long delay of the 54-bit timer."""
     emu, dev = rig
+    tick = max(dev.caps["tick_hz"])
     # the WAIT merges into the step's delay: total 2*0xC000+5 ticks
     wait = 2 * 0xC000 + 5 - 1000
     segs = [(0, wait, 0, 0, pc.FLAG_WAIT), (1, 1000 << 16, 0, 0, pc.FLAG_DIR),
             (0, 2000, 0, 0, pc.FLAG_WAIT)]
-    dev.command(f"LOAD {len(segs)} 16000000 1 ttl")
+    dev.command(f"LOAD {len(segs)} {tick} 1 ttl")
     for k, seg in enumerate(segs):
         dev.command("SEG " + " ".join(map(str, seg)), expect=f"OK {k}")
     dev.command(f"END {pc.segments_checksum(segs)}")
@@ -192,7 +210,7 @@ def test_long_wait_last_chunk_not_missed(rig):
     t0 = emu.ttl()
     assert "overruns=0" in dev.wait_event("EV DONE", timeout=30)
     rise = edges(emu.trace(), "step", 1)
-    late_us = (rise[0] - t0 - (wait + 1000)) / CYC_PER_US  # 16 MHz tick = 1 cycle
+    late_us = (rise[0] - t0 - (wait + 1000) * emu.f_cpu / tick) / (emu.f_cpu / 1e6)
     assert 0 < late_us < 10, late_us
 
 
@@ -201,7 +219,7 @@ def test_protocol_errors(rig):
     with pytest.raises(DeviceError):
         dev.command("LOAD 3 12345 1 now")  # unsupported tick
     with pytest.raises(DeviceError):
-        dev.command("LOAD 1000 2000000 1 now")  # too many segments
+        dev.command(f"LOAD {dev.caps['max_segments'] + 1} 2000000 1 now")  # too many segments
     with pytest.raises(DeviceError):
         dev.command("ARM")  # no program
     dev.command("LOAD 1 2000000 1 now")
@@ -225,6 +243,6 @@ def test_jog_and_zero(rig):
     assert len(rise) == 40
     # the first steps overlap "OK JOG"/"EV START" being sent: the USART interrupt
     # can delay a step by ~1.5 us (it never accumulates)
-    assert np.all(np.abs(np.diff(rise) - emumod.F_CPU / 4000) <= 40)
+    assert np.all(np.abs(np.diff(rise) - emu.f_cpu / 4000) <= 2.5e-6 * emu.f_cpu)
     dev.zero()
     assert dev.status()["pos"] == 0

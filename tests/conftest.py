@@ -27,3 +27,13 @@ def hex_path():
             pytest.skip("firmware hex missing and no avr-g++ to build it")
         return emumod.build_hex()
     return emumod.DEFAULT_HEX
+
+
+@pytest.fixture(scope="session")
+def esp32_bin():
+    """The host ESP32-S3 emulator (built on demand with the host C++ compiler)."""
+    if os.environ.get("PHANTOM_REBUILD") or not os.path.exists(emumod.ESP32_BIN):
+        if shutil.which(os.environ.get("CXX", "g++")) is None:
+            pytest.skip("no host C++ compiler to build the ESP32 emulator")
+        return emumod.build_esp32()
+    return emumod.ESP32_BIN

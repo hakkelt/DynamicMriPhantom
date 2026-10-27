@@ -1,14 +1,22 @@
-"""Python front end for the avr8js emulator (emulator/avr/run_avr.mjs).
+"""Python front ends for the two emulated boards.
 
-    with AvrEmulator() as emu:
+* ``AvrEmulator``: the ATmega328P firmware hex in avr8js (emulator/avr/run_avr.mjs),
+  cycle accurate.
+* ``Esp32Emulator``: the firmware's ESP32-S3 code path compiled for the host
+  against a simulated gptimer/GPIO (emulator/esp32/sim.cpp); checks the logic
+  and integer timing of the ESP32 back end, not the Xtensa core.
+
+Both have the same interface:
+
+    with AvrEmulator() as emu:          # or Esp32Emulator()
         dev = PhantomDevice(emu.url)    # socket://127.0.0.1:<port>
         ...
         emu.ttl()                       # MRI trigger pulse
-        trace = emu.trace()             # [(cycle, pin, level), ...]
+        trace = emu.trace()             # [(cycle, pin, level), ...]; emu.f_cpu cycles/s
 
 Command line (run a virtual board for the GUI, in real time):
 
-    python emulator/emulator.py [--build] [--port 5555] [--fast]
+    python emulator/emulator.py [--board atmega328p|esp32s3] [--build] [--port 5555] [--fast]
 
 then connect the GUI to ``socket://127.0.0.1:5555``. Type ``ttl`` or
 ``button`` (Enter) to pulse the MRI input or press the button.
@@ -27,9 +35,10 @@ import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-F_CPU = 16_000_000
+F_CPU = 16_000_000  # ATmega328P
 DEFAULT_HEX = os.path.join(ROOT, "build", "avr-atmega328p", "segment_player.hex")
 RUNNER = os.path.join(HERE, "avr", "run_avr.mjs")
+ESP32_BIN = os.path.join(ROOT, "build", "esp32-host", "segment_player")
 
 
 def node_available() -> bool:
@@ -42,25 +51,34 @@ def build_hex(mcu: str = "atmega328p") -> str:
     return os.path.join(ROOT, "build", f"avr-{mcu}", "segment_player.hex")
 
 
-class AvrEmulator:
-    def __init__(self, hex_path: str = DEFAULT_HEX, realtime: bool = False, port: int = 0,
-                 max_seconds: float = 0, trace: bool = True):
-        self.hex_path = hex_path
+def build_esp32() -> str:
+    subprocess.run(["bash", os.path.join(HERE, "build_esp32.sh")], check=True)
+    return ESP32_BIN
+
+
+class _Emulator:
+    """A board process: serial on a TCP port, pin trace, stdin control."""
+    board = ""
+    f_cpu = 0
+    name = "emulator"
+
+    def __init__(self, realtime: bool = False, port: int = 0, max_seconds: float = 0, trace: bool = True):
         self.realtime = realtime
         self.port = port
         self.max_seconds = max_seconds
         self.proc = None
         self.url = None
         self._out: "queue.Queue[str]" = queue.Queue()
-        self._tmp = tempfile.mkdtemp(prefix="avr-emu-")
+        self._tmp = tempfile.mkdtemp(prefix="phantom-emu-")
         self.trace_path = os.path.join(self._tmp, "trace.txt") if trace else None
         self._trace = []      # events read so far
         self._trace_pos = 0   # bytes of the trace file already parsed
 
-    def start(self) -> "AvrEmulator":
-        if not os.path.exists(self.hex_path):
-            raise FileNotFoundError(f"{self.hex_path} not found: run emulator/build_avr.sh first")
-        cmd = ["node", RUNNER, "--hex", self.hex_path, "--port", str(self.port)]
+    def _command(self) -> list:
+        raise NotImplementedError
+
+    def start(self):
+        cmd = self._command() + ["--port", str(self.port)]
         if self.trace_path:
             cmd += ["--trace", self.trace_path]
         if self.realtime:
@@ -132,17 +150,52 @@ class AvrEmulator:
         self.stop()
 
 
+class AvrEmulator(_Emulator):
+    board = "atmega328p"
+    f_cpu = F_CPU
+    name = "ATmega328P (avr8js)"
+
+    def __init__(self, hex_path: str = DEFAULT_HEX, **kw):
+        super().__init__(**kw)
+        self.hex_path = hex_path
+
+    def _command(self) -> list:
+        if not os.path.exists(self.hex_path):
+            raise FileNotFoundError(f"{self.hex_path} not found: run emulator/build_avr.sh first")
+        return ["node", RUNNER, "--hex", self.hex_path]
+
+
+class Esp32Emulator(_Emulator):
+    board = "esp32s3"
+    f_cpu = 240_000_000
+    name = "ESP32-S3 (host simulation)"
+
+    def __init__(self, binary: str = ESP32_BIN, **kw):
+        super().__init__(**kw)
+        self.binary = binary
+
+    def _command(self) -> list:
+        if not os.path.exists(self.binary):
+            raise FileNotFoundError(f"{self.binary} not found: run emulator/build_esp32.sh first")
+        return [self.binary]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--hex", default=DEFAULT_HEX)
+    ap.add_argument("--board", choices=["atmega328p", "esp32s3"], default="atmega328p")
+    ap.add_argument("--hex", default=DEFAULT_HEX, help="firmware hex (atmega328p)")
     ap.add_argument("--build", action="store_true", help="build the firmware first")
     ap.add_argument("--port", type=int, default=5555)
     ap.add_argument("--fast", action="store_true", help="do not throttle to real time")
     args = ap.parse_args()
-    if args.build:
-        args.hex = build_hex()
-    emu = AvrEmulator(args.hex, realtime=not args.fast, port=args.port, trace=False).start()
-    print(f"Emulated ATmega328P running. Connect to {emu.url}")
+    if args.board == "esp32s3":
+        emu = Esp32Emulator(build_esp32() if args.build else ESP32_BIN,
+                            realtime=not args.fast, port=args.port, trace=False)
+    else:
+        emu = AvrEmulator(build_hex() if args.build else args.hex,
+                          realtime=not args.fast, port=args.port, trace=False)
+    emu.start()
+    print(f"Emulated {emu.name} running. Connect to {emu.url}")
     print("Commands: ttl | button | quit")
     try:
         for line in sys.stdin:

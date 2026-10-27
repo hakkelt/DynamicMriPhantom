@@ -37,8 +37,10 @@ The button connects to GND (internal pull-up). The MRI TTL input on the ESP32
 is 3.3 V: level-shift a 5 V scanner trigger. See
 [arduino_firmware/Notes.txt](arduino_firmware/Notes.txt) for board settings.
 
-> **ESP32 status:** the ESP32 code path compiles in CI but has **not** been
-> tested on hardware. The AVR path is verified in the emulator. Real-hardware
+> **ESP32 status:** the ESP32 code path compiles in CI and its logic and
+> integer timing pass the same end-to-end tests as the AVR in a host
+> simulation (see [Emulator](#emulator-local-and-ci)), but it has **not** been
+> tested on hardware. The AVR path is verified cycle-accurately. Real-hardware
 > validation (logic analyser on STEP/DIR, driver current limit) is still to
 > be done.
 
@@ -51,7 +53,8 @@ is 3.3 V: level-shift a 5 V scanner trigger. See
 | `python_serial/phantom_device.py` | Serial protocol (real port or `socket://` URL) |
 | `python_serial/phantom_gui.py` | Main window: connect, open/save, jumpers, upload, arm/start/stop, jog |
 | `python_serial/phantom_designer.py` | Designer window: parameters, automatic microstep/tick choice, plots |
-| `emulator/` | AVR emulator (avr8js) + build script + Python wrapper |
+| `python_serial/phantom_style.py` | Shared look of both windows (ttk theme, report text, plot style) |
+| `emulator/` | Board emulators: ATmega328P (avr8js) and ESP32-S3 (host simulation), build scripts, Python wrapper |
 | `tests/` | Unit, host cross-check, emulator end-to-end and GUI tests |
 
 ## Quick start
@@ -181,6 +184,12 @@ and the device capabilities it was compiled for.
 
 ## Emulator (local and CI)
 
+Both board families can be emulated; they share one interface
+(`emulator/emulator.py`: serial on a TCP socket, STEP/DIR/TTL edge trace,
+`ttl`/`button` inputs), so the end-to-end tests run on both.
+
+### ATmega328P (avr8js, cycle accurate)
+
 The firmware for the ATmega328P runs unmodified in
 [avr8js](https://github.com/wokwi/avr8js) (Node.js). Its UART is bridged to a
 TCP socket, and every STEP/DIR/TTL edge is recorded with its CPU cycle.
@@ -201,10 +210,32 @@ The harness works around an avr8js 0.21.1 bug: a write to UCSR0B drops a
 pending RX interrupt, which loses received bytes while the firmware is
 transmitting.
 
+### ESP32-S3 (host simulation)
+
+`emulator/build_esp32.sh` compiles the sketch's ESP32 code path with the host
+g++ against small stand-ins for the Arduino-ESP32/ESP-IDF APIs it uses
+(`emulator/esp32/stubs`) and links it with `emulator/esp32/sim.cpp`: a virtual
+240 MHz clock, the gptimer (alarm callback run like an interrupt, 1.5 µs after
+the alarm), GPIO register writes, the TTL edge interrupt and critical sections.
+Interrupts preempt the main loop between API calls, never inside a critical
+section.
+
+```bash
+emulator/build_esp32.sh                # -> build/esp32-host/segment_player
+python emulator/emulator.py --board esp32s3
+```
+
+This checks the logic and the integer timing of the ESP32 back end (alarm
+scheduling, overrun handling, TTL start, DIR/STEP order, pulse width). It is
+not an Xtensa CPU model: the interrupt latencies are assumptions, so the
+trigger latency must still be measured on hardware. The model gives ~3.2 µs,
+while CAPS currently states 2 µs.
+
 ## Tests
 
 ```bash
 npm ci --prefix emulator/avr && emulator/build_avr.sh
+emulator/build_esp32.sh                # optional: built on demand by the tests
 xvfb-run -a python -m pytest -v        # or plain pytest without the GUI tests
 ```
 
@@ -214,7 +245,8 @@ xvfb-run -a python -m pytest -v        # or plain pytest without the GUI tests
 - `test_engine_cross.py`: `seg_engine.h` compiled with g++ vs the Python
   simulator. Event times must be bit-identical, including wrap-around edge
   cases.
-- `test_emulator.py`: the real firmware in avr8js:
+- `test_emulator.py`: the real firmware on both emulated boards (each test
+  runs for `atmega328p` and `esp32s3`):
   - TTL/now/button triggers, and that only the first TTL edge counts
   - every step time against the plan (constant latency, < 1 µs jitter)
   - pulse width and DIR setup
