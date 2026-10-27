@@ -329,6 +329,9 @@ class DesignerWindow(tk.Toplevel):
             ps.kv(parts, "Start/stop speed", f"{m['max_start_stop_speed_dps']:.1f} deg/s")
             ps.kv(parts, "Timing error", f"≤ {m['max_timing_error_us']:.2f} µs")
             ps.kv(parts, "Position error", f"≤ {m['max_position_error_deg']:.4f} deg")
+            if m.get("streamed"):
+                ps.kv(parts, "Streaming", f"margin {m['stream_slack_ms']:.0f} ms · "
+                                          f"link {m['stream_link_load']:.0%} of 115200 baud")
             parts += [(f"Warning: {w}\n", "warn") for w in t.warnings]
         parts.append(("Tried (largest microstep, finest tick first)\n", "head"))
         for a in res.attempts:

@@ -11,6 +11,13 @@
 //   WAIT segment: a pure delay of `interval` whole ticks (frac unchanged).
 // Delays of consecutive WAITs are merged into the delay of the next step.
 // `frac` is reset at the start of every cycle so every cycle is identical.
+//
+// Two sources of segments:
+//   resident: a table of `nseg` segments played `cycles` times (0 = forever);
+//   stream:   a Ring filled by the host while playing. The first segment of
+//             every cycle carries F_CYCLE (frac reset, cycle count). An empty
+//             ring ends the playback normally once the host closed the stream,
+//             otherwise it is an underrun (EV_UNDERRUN): the segment is needed now.
 #pragma once
 
 #include <stdint.h>
@@ -21,8 +28,8 @@
 
 namespace seg {
 
-enum : uint8_t { F_DIR = 0x01, F_WAIT = 0x02 };
-enum : uint8_t { EV_DELAY = 0, EV_STEP = 1, EV_END = 2 };
+enum : uint8_t { F_DIR = 0x01, F_WAIT = 0x02, F_CYCLE = 0x04 };
+enum : uint8_t { EV_DELAY = 0, EV_STEP = 1, EV_END = 2, EV_UNDERRUN = 3 };
 
 struct __attribute__((packed)) Segment {
     uint16_t count;
@@ -33,6 +40,37 @@ struct __attribute__((packed)) Segment {
 };
 static_assert(sizeof(Segment) == 15, "Segment must be packed to 15 bytes");
 
+// Single-producer (main loop) / single-consumer (engine) segment queue. The
+// producer must update `count` with the consumer's interrupt masked.
+struct Ring {
+    Segment* buf;
+    uint16_t cap;
+    uint16_t head;            // next slot to write (producer)
+    uint16_t tail;            // next slot to read (consumer)
+    volatile uint16_t count;  // segments waiting
+    volatile uint8_t closed;  // the host sent its last segment
+    volatile uint32_t consumed;
+
+    void reset(Segment* b, uint16_t c) {
+        buf = b;
+        cap = c;
+        head = tail = 0;
+        count = 0;
+        closed = 0;
+        consumed = 0;
+    }
+    // Copy `s` into the next free slot; call push_commit() (interrupt masked) after.
+    bool push_write(const Segment& s) {
+        if (count >= cap) return false;
+        buf[head] = s;
+        return true;
+    }
+    void push_commit() {
+        head = (uint16_t)(head + 1 == cap ? 0 : head + 1);
+        ++count;
+    }
+};
+
 struct Event {
     uint32_t ticks;  // delay from the previous event
     uint8_t kind;    // EV_STEP, EV_DELAY or EV_END
@@ -41,6 +79,9 @@ struct Event {
 
 struct Engine {
     const Segment* segs;
+    Ring* ring;       // stream source (nullptr: resident table)
+    uint8_t started;  // a segment was entered (stream: the first F_CYCLE starts cycle 0)
+    uint8_t underrun;
     uint16_t nseg;
     uint32_t cycles;  // 0 = forever
     uint32_t cycle;   // completed cycles
@@ -55,6 +96,7 @@ struct Engine {
 
     void begin(const Segment* s, uint16_t n, uint32_t ncycles) {
         segs = s;
+        ring = nullptr;
         nseg = n;
         cycles = ncycles;
         cycle = 0;
@@ -64,9 +106,46 @@ struct Engine {
         frac = 0;
         flags = 0;
         finish_req = 0;
+        started = 0;
+        underrun = 0;
+    }
+
+    void begin_stream(Ring* r) {
+        begin(nullptr, 0xFFFE, 0);
+        ring = r;
+    }
+
+    // Stream source: take the next segment from the ring.
+    SEG_ISR_ATTR bool enter_stream() {
+        Ring& r = *ring;
+        if (r.count == 0) {
+            underrun = !r.closed;
+            if (!underrun && started) ++cycle;  // the last cycle is complete
+            return false;
+        }
+        const Segment& s = r.buf[r.tail];
+        if (s.flags & F_CYCLE) {
+            if (started) {
+                ++cycle;
+                if (finish_req) return false;
+            }
+            frac = 0;
+        }
+        started = 1;
+        ++idx;
+        flags = s.flags;
+        left = (flags & F_WAIT) ? 1 : s.count;
+        interval = s.interval;
+        add = (uint32_t)s.add;
+        add2 = (uint32_t)s.add2;
+        r.tail = (uint16_t)(r.tail + 1 == r.cap ? 0 : r.tail + 1);
+        --r.count;
+        ++r.consumed;
+        return true;
     }
 
     SEG_ISR_ATTR bool enter() {
+        if (ring) return enter_stream();
         ++idx;
         if (idx >= nseg) {
             ++cycle;
@@ -93,7 +172,7 @@ struct Engine {
         for (;;) {
             if (left == 0) {
                 if (!enter()) {
-                    kind = EV_END;
+                    kind = underrun ? EV_UNDERRUN : EV_END;
                     break;
                 }
                 if (++guard > nseg + 1) {  // a cycle without any step

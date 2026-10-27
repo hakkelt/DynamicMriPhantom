@@ -22,12 +22,27 @@ pytestmark = pytest.mark.emulator
 BOARDS = ["atmega328p", "esp32s3"]
 
 
+def start_emulator(request, realtime=False):
+    if request.param == "esp32s3":
+        return emumod.Esp32Emulator(request.getfixturevalue("esp32_bin"), realtime=realtime).start()
+    return emumod.AvrEmulator(request.getfixturevalue("hex_path"), realtime=realtime).start()
+
+
+@pytest.fixture(params=BOARDS)
+def rig_rt(request):
+    """Like ``rig``, but the board runs in real time (streaming: the host must keep pace)."""
+    emu = start_emulator(request, realtime=True)
+    events = []
+    dev = PhantomDevice(emu.url, timeout=10, boot_wait=2, on_event=events.append)
+    dev.open()
+    yield emu, dev
+    dev.close()
+    emu.stop()
+
+
 @pytest.fixture(params=BOARDS)
 def rig(request):
-    if request.param == "esp32s3":
-        emu = emumod.Esp32Emulator(request.getfixturevalue("esp32_bin")).start()
-    else:
-        emu = emumod.AvrEmulator(request.getfixturevalue("hex_path")).start()
+    emu = start_emulator(request)
     events = []
     dev = PhantomDevice(emu.url, timeout=10, boot_wait=2, on_event=events.append)
     dev.open()
@@ -52,7 +67,7 @@ def expected_steps(emu, traj, cycles):
     return st * (emu.f_cpu / traj.tick_hz), dirs[kinds == pc.EV_STEP]
 
 
-def check_waveform(emu, trace, traj, cycles, t0_cycle):
+def check_waveform(emu, trace, traj, cycles, t0_cycle, streamed=False):
     cyc_per_us = emu.f_cpu / 1e6
     rise = edges(trace, "step", 1)
     fall = edges(trace, "step", 0)
@@ -60,8 +75,14 @@ def check_waveform(emu, trace, traj, cycles, t0_cycle):
     assert len(rise) == len(exp_t), "step count"
     offset_us = (rise - t0_cycle - exp_t) / cyc_per_us
     # constant trigger latency, sub-microsecond jitter, nothing accumulates
-    assert 0 < offset_us.min() and offset_us.max() < 10, offset_us
-    assert offset_us.max() - offset_us.min() < 1.0, offset_us.max() - offset_us.min()
+    jitter = offset_us - np.median(offset_us)
+    if streamed and emu.board == "atmega328p":
+        # streamed segments arrive while playing: each received byte runs the
+        # USART interrupt (~3.5 us), which can delay a step; about 1 % of them
+        assert jitter.max() < 9.0 and np.mean(jitter > 1.0) < 0.03, (jitter.max(), np.mean(jitter > 1.0))
+    else:
+        assert offset_us.max() - offset_us.min() < 1.0, offset_us.max() - offset_us.min()
+    assert 0 < offset_us.min() and np.median(offset_us) < 10, offset_us
     # pulse width (DRV8825 >= 1.9 us, A4988 >= 1 us)
     width_us = (fall[: len(rise)] - rise) / cyc_per_us
     assert width_us.min() >= 2.0
@@ -246,3 +267,100 @@ def test_jog_and_zero(rig):
     assert np.all(np.abs(np.diff(rise) - emu.f_cpu / 4000) <= 2.5e-6 * emu.f_cpu)
     dev.zero()
     assert dev.status()["pos"] == 0
+
+
+# -- streaming -----------------------------------------------------------------
+
+def stream_design():
+    # 5 irregular periods: 90-100 segments, more than the ATmega's 72
+    return pc.Design(shape="sinusoid", amplitude_deg=10, length_ms=300, n_periods=5, length_spread_pct=10,
+                     amplitude_spread_pct=10, skew_jitter=0.1, delay_ms=50, delay_spread_pct=10)
+
+
+def test_stream_plays_exactly(rig_rt):
+    emu, dev = rig_rt
+    traj = pc.compile_design(stream_design(), pc.Limits(), {**dev.caps, "max_segments": 72})
+    assert len(traj.segments) > 72 and traj.metrics["streamed"]
+    # a 16-slot ring: the host refills it many times per cycle
+    session = dev.stream(traj, cycles=2, trigger="ttl", slots=16)
+    assert session.sent == 16
+    dev.arm()
+    t0 = emu.ttl()
+    done = dev.wait_event("EV ", timeout=60)
+    assert done.startswith("EV START")
+    done = dev.wait_event("EV DONE", timeout=60)
+    assert "overruns=0" in done and "pos=0" in done
+    assert "cycles=2" in done
+    assert session.sent == 2 * len(traj.segments) and session.closed
+    check_waveform(emu, emu.trace(), traj, 2, t0, streamed=True)
+    assert dev.status()["state"] == "idle"  # a streamed program is used up
+
+
+def test_stream_finish_stops_at_cycle_end(rig_rt):
+    emu, dev = rig_rt
+    traj = pc.compile_design(stream_design(), pc.Limits(), {**dev.caps, "max_segments": 72})
+    dev.stream(traj, cycles=0, trigger="now", slots=16)
+    dev.arm()
+    time.sleep(traj.cycle_s * 0.5)
+    dev.finish()
+    done = dev.wait_event("EV DONE", timeout=60)
+    assert "pos=0" in done and "overruns=0" in done
+    n = len(traj.step_targets()[0])
+    rise = edges(emu.trace(), "step", 1)
+    assert len(rise) > 0 and len(rise) % n == 0
+
+
+def test_stream_underrun_aborts_and_reports(rig):
+    """The host stops feeding: the device aborts at the first missing segment,
+    STEP stays low and the host is told where the motor is."""
+    emu, dev = rig
+    traj = pc.compile_design(stream_design(), pc.Limits(), {**dev.caps, "max_segments": 72})
+    k = 20
+    dev.command(f"STREAM {traj.tick_hz} now", expect="OK STREAM")
+    for i, seg in enumerate(traj.segments[:k]):
+        dev.command(pc.stream_line(seg, i == 0), expect=f"SS {i}")
+    dev.arm()
+    abort = dev.wait_event("EV ABORT", timeout=60)
+    assert abort.startswith("EV ABORT underrun")
+    fields = dict(tok.split("=") for tok in abort.split()[3:])
+    times, kinds, dirs = pc.simulate_engine(traj.segments[:k], 1)
+    steps = kinds == pc.EV_STEP
+    expected_pos = int(np.sum(np.where(dirs[steps] == 1, 1, -1)))
+    assert int(fields["consumed"]) == k and int(fields["pos"]) == expected_pos != 0
+    trace = emu.trace()
+    assert len(edges(trace, "step", 1)) == int(steps.sum())
+    assert [v for _, p, v in trace if p == "step"][-1] == 0  # STEP left low
+    st = dev.status()
+    assert st["state"] == "idle" and st["pos"] == expected_pos
+    with pytest.raises(DeviceError):
+        dev.arm()  # nothing left to play
+
+
+def test_stream_refuses_corrupted_segment(rig):
+    _, dev = rig
+    dev.command("STREAM 2000000 now", expect="OK STREAM")
+    line = pc.stream_line((10, 6553600, 0, 0, 1), True)
+    bad = line.rsplit(" ", 1)[0] + " " + str((int(line.rsplit(" ", 1)[1]) + 1) & 0xFFFF)
+    with pytest.raises(DeviceError, match="SS crc"):
+        dev.command(bad, expect="SS")
+    dev.command(line, expect="SS 0")
+    dev.command("CLOSE", expect="OK CLOSE")
+    with pytest.raises(DeviceError, match="SS closed"):
+        dev.command(line, expect="SS")
+
+
+def test_stream_host_stall_is_reported_to_python(rig):
+    """The PC stops feeding mid-run (stall, crash): the session learns of the
+    device's abort and the position it stopped at."""
+    _, dev = rig
+    traj = pc.compile_design(stream_design(), pc.Limits(), {**dev.caps, "max_segments": 72})
+    session = dev.stream(traj, cycles=0, trigger="now", slots=8)
+    session.detach()  # the host stalls: nothing more is sent
+    dev.arm()
+    abort = dev.wait_event("EV ABORT", timeout=60)
+    assert abort.startswith("EV ABORT underrun consumed=8 ")
+    deadline = time.monotonic() + 5
+    while session.result is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert session.result == abort
+    assert dev.status()["pos"] == int(abort.split("pos=")[1].split()[0])

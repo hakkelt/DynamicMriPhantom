@@ -2,10 +2,16 @@
 
 Works with a real port (``/dev/ttyUSB0``, ``/dev/ttyACM0``, ``COM3``) or any
 pyserial URL, e.g. ``socket://127.0.0.1:5555`` for the AVR emulator.
+
+A program that fits in the device is uploaded once (``upload``). A larger one
+is streamed (``stream``): the device's segment memory becomes a ring that a
+``StreamSession`` thread keeps filled while the device plays. If the ring runs
+dry the device aborts at once and reports ``EV ABORT underrun ...``.
 """
 
 from __future__ import annotations
 
+import itertools
 import json
 import queue
 import threading
@@ -47,6 +53,8 @@ class PhantomDevice:
         self._running = False
         self._banner_seen = threading.Event()
         self._uploading = False
+        self._wlock = threading.Lock()  # one writer at a time: lines never interleave
+        self.session: Optional["StreamSession"] = None
 
     # -- connection ---------------------------------------------------------
     def open(self) -> dict:
@@ -95,7 +103,11 @@ class PhantomDevice:
         buf = b""
         while self._running:
             try:
-                chunk = self._ser.read(256)
+                # wait for one byte, then take whatever else has arrived (a plain
+                # read(256) would wait for the whole timeout on every reply)
+                chunk = self._ser.read(1)
+                if chunk:
+                    chunk += self._ser.read(self._ser.in_waiting)
             except Exception:
                 break
             if not chunk:
@@ -106,10 +118,18 @@ class PhantomDevice:
                 line = raw.decode("ascii", "replace").strip()
                 if not line:
                     continue
+                session = self.session
+                if session is not None and session.claims(line):
+                    session.feed(line)  # stream acks and EV FREE: not logged (too many)
+                    if not (line.startswith("SS ") or line.startswith("EV FREE")) and self.on_line:
+                        self.on_line("<", line)
+                    continue
                 # per-segment acks are reported through upload(progress=...)
                 if self.on_line and not (self._uploading and line.startswith("OK ")):
                     self.on_line("<", line)
                 if line.startswith("EV "):
+                    if session is not None:
+                        session.feed(line)
                     self._events.put(line)
                     if self.on_event:
                         self.on_event(line)
@@ -125,7 +145,16 @@ class PhantomDevice:
             raise DeviceError("not connected")
         if log and self.on_line:
             self.on_line(">", text)
-        self._ser.write((text + "\n").encode("ascii"))
+        with self._wlock:
+            self._ser.write((text + "\n").encode("ascii"))
+
+    def _emit_event(self, line: str) -> None:
+        """Report a host-side event like a device one (EV ABORT host ...)."""
+        if self.on_line:
+            self.on_line("!", line)
+        self._events.put(line)
+        if self.on_event:
+            self.on_event(line)
 
     def _reply(self, timeout: Optional[float] = None) -> str:
         try:
@@ -190,6 +219,9 @@ class PhantomDevice:
                progress: Optional[Callable[[int, int], None]] = None) -> None:
         if trigger not in TRIGGERS:
             raise ValueError(f"trigger must be one of {TRIGGERS}")
+        if self.session is not None:  # a resident program replaces a stream
+            self.session.detach()
+            self.session = None
         segs = traj.segments
         n = len(segs)
         # Keep only as many SEG lines in flight as the receive buffer holds.
@@ -219,6 +251,33 @@ class PhantomDevice:
             if line != f"OK END {n} {traj.checksum}":
                 raise DeviceError(f"END: unexpected reply {line}")
 
+    def needs_streaming(self, traj: "pc.CompiledTrajectory") -> bool:
+        return len(traj.segments) > int((self.caps or {}).get("max_segments", 0))
+
+    def stream(self, traj: "pc.CompiledTrajectory", cycles: int = 0, trigger: str = "ttl",
+               slots: Optional[int] = None,
+               progress: Optional[Callable[[int, int], None]] = None) -> "StreamSession":
+        """Open a stream, fill the device's ring and keep it filled on a thread.
+
+        Arm afterwards (``arm()``), like after ``upload``. ``cycles`` = 0 plays
+        until ``finish()``/``stop()``. ``slots`` limits the ring (tests). The
+        session ends with the device's EV DONE or EV ABORT; host-side failures
+        are reported as ``EV ABORT host <reason>`` (the device is stopped).
+        """
+        if trigger not in TRIGGERS:
+            raise ValueError(f"trigger must be one of {TRIGGERS}")
+        if not (self.caps or {}).get("stream"):
+            raise DeviceError("the device cannot stream")
+        if self.session is not None:
+            self.session.detach()
+        line = self.command(f"STREAM {traj.tick_hz} {trigger}", expect="OK STREAM")
+        dev_slots = int(line.split()[2])
+        session = StreamSession(self, traj, cycles, min(slots or dev_slots, dev_slots), progress)
+        self.session = session
+        session.prefill()
+        session.start()
+        return session
+
     def arm(self, trigger: Optional[str] = None, cycles: Optional[int] = None) -> str:
         """Arm with the trigger/cycles given at LOAD, or override them (the
         firmware takes cycles only after a trigger)."""
@@ -231,11 +290,18 @@ class PhantomDevice:
         return self.command("ARM" + args)
 
     def stop(self) -> int:
+        if self.session is not None:
+            self.session.stopping = True
         line = self.command("STOP")
+        if self.session is not None:
+            self.session.detach()
         return int(line.split("pos=")[1])
 
     def finish(self) -> None:
+        """Stop at the end of the current cycle (a stream sends up to there and closes)."""
         self.command("FINISH")
+        if self.session is not None:
+            self.session.finish()
 
     def zero(self) -> None:
         self.command("ZERO")
@@ -243,3 +309,155 @@ class PhantomDevice:
     def jog(self, steps: int, rate_hz: int) -> None:
         self.clear_events()
         self.command(f"JOG {int(steps)} {int(rate_hz)}")
+
+
+class StreamSession:
+    """Keeps the device's segment ring filled while a streamed program plays.
+
+    Segment k of the stream is ``traj.segments[k % n]``; the first of every
+    cycle carries FLAG_CYCLE. The host sends while the device has a free slot
+    (it reports ``EV FREE <consumed>``) and at most ``rx_buffer`` bytes of SS
+    lines are unacknowledged. Each SS line carries its CRC. Any refusal or
+    silence of the device stops the run (``EV ABORT host <reason>``).
+    """
+
+    def __init__(self, dev: PhantomDevice, traj: "pc.CompiledTrajectory", cycles: int, slots: int,
+                 progress: Optional[Callable[[int, int], None]] = None):
+        self.dev = dev
+        self.segments = list(traj.segments)
+        self.cycles = int(cycles)
+        self.slots = slots
+        self.progress = progress
+        n = len(self.segments)
+        self.total = n * self.cycles if self.cycles > 0 else None  # None: until finished
+        self.sent = 0
+        self.acked = 0
+        self.consumed = 0
+        self.closed = False
+        self.stopping = False
+        self.result: Optional[str] = None  # final EV DONE / EV ABORT line
+        self._inflight: list[int] = []     # byte length of unacknowledged SS lines
+        self._acks: "queue.Queue[str]" = queue.Queue()
+        self._cv = threading.Condition()
+        self._thread: Optional[threading.Thread] = None
+        # bytes of SS lines in flight; always at least one line
+        self._window = int((dev.caps or {}).get("rx_buffer", 64)) - 8
+        self._lines = (pc.stream_line(s, k == 0) for k, s in
+                       itertools.cycle(enumerate(self.segments)))
+
+    # -- reader thread ------------------------------------------------------
+    def claims(self, line: str) -> bool:
+        return (line.startswith("SS ") or line.startswith("ERR SS") or line == "OK CLOSE"
+                or line.startswith("EV FREE"))
+
+    def feed(self, line: str) -> None:
+        with self._cv:
+            if line.startswith("EV FREE"):
+                self.consumed = max(self.consumed, int(line.split()[2]))
+            elif line.startswith("EV DONE") or line.startswith("EV ABORT"):
+                self.result = line
+            elif not line.startswith("EV "):
+                self._acks.put(line)
+            self._cv.notify_all()
+        if self.progress and line.startswith("EV FREE"):
+            self.progress(self.sent, self.consumed)
+
+    # -- sending ------------------------------------------------------------
+    @property
+    def ended(self) -> bool:
+        return self.result is not None or self.stopping
+
+    def finish(self) -> None:
+        """Send up to the end of the cycle being sent, then close the stream."""
+        with self._cv:
+            n = len(self.segments)
+            end = -(-self.sent // n) * n
+            self.total = end if self.total is None else min(self.total, end)
+            self._cv.notify_all()
+
+    def _room(self) -> bool:
+        """Another SS line fits in the device's receive buffer."""
+        return not self._inflight or sum(self._inflight) + MAX_SEG_LINE + 8 <= self._window
+
+    def _send_next(self) -> None:
+        line = next(self._lines)
+        self._inflight.append(len(line) + 1)
+        self.dev._send(line, log=False)
+        self.sent += 1
+
+    def _take_ack(self, timeout: float) -> None:
+        try:
+            line = self._acks.get(timeout=timeout)
+        except queue.Empty:
+            raise DeviceError("no answer to streamed segment") from None
+        if line.startswith("ERR"):
+            raise DeviceError(f"device refused streamed segment {self.acked}: {line[4:]}")
+        if line == "OK CLOSE":
+            return
+        if line != f"SS {self.acked}":
+            raise DeviceError(f"streamed segment {self.acked}: unexpected reply {line}")
+        self._inflight.pop(0)
+        self.acked += 1
+
+    def _pump(self, until: int) -> None:
+        """Send segments up to ``until`` (exclusive) and wait for all their acks."""
+        while self.acked < until:
+            while self.sent < until and self.sent - self.consumed < self.slots and self._room():
+                self._send_next()
+            if self.acked < self.sent:
+                self._take_ack(self.dev.timeout)
+            else:
+                return
+
+    def prefill(self) -> None:
+        """Fill the ring before ARM (synchronous)."""
+        first = self.slots if self.total is None else min(self.slots, self.total)
+        self._pump(first)
+        if self.progress:
+            self.progress(self.sent, self.consumed)
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="phantom-stream", daemon=True)
+        self._thread.start()
+
+    def detach(self) -> None:
+        """Stop feeding (after STOP, or when a new program replaces this one)."""
+        with self._cv:
+            self.stopping = True
+            self._cv.notify_all()
+
+    def _close(self) -> None:
+        self.dev._send("CLOSE")
+        line = self._acks.get(timeout=self.dev.timeout)
+        if line != "OK CLOSE":
+            raise DeviceError(f"CLOSE: unexpected reply {line}")
+        self.closed = True
+
+    def _run(self) -> None:
+        try:
+            while not self.ended:
+                target = self.total
+                if target is not None and self.sent >= target and self.acked >= self.sent:
+                    self._close()
+                    break
+                with self._cv:
+                    can_send = ((target is None or self.sent < target)
+                                and self.sent - self.consumed < self.slots and self._room())
+                if can_send:
+                    self._send_next()
+                    continue
+                if self.acked < self.sent:
+                    self._take_ack(self.dev.timeout)
+                    continue
+                with self._cv:  # wait for a free slot (EV FREE), the end, or finish()
+                    self._cv.wait(timeout=0.2)
+        except (DeviceError, OSError, queue.Empty) as exc:
+            if self.ended:
+                return
+            self.stopping = True
+            try:
+                self.dev._send("STOP")
+            except Exception:
+                pass
+            self.result = f"EV ABORT host {exc}"
+            self.dev._emit_event(self.result)

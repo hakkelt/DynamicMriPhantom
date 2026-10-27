@@ -299,6 +299,9 @@ class PhantomApp:
                                        f"{m.get('peak_step_rate_hz', 0):.0f} steps/s")
             ps.kv(parts, "Max errors", f"timing {m.get('max_timing_error_us', 0):.2f} µs · "
                                        f"position {m.get('max_position_error_deg', 0):.4f} deg")
+            if m.get("streamed"):
+                ps.kv(parts, "Streaming", f"margin {m['stream_slack_ms']:.0f} ms · "
+                                          f"link {m['stream_link_load']:.0%}")
             ps.kv(parts, "Compiled for", t.device_caps.get("board", "?"))
             parts += [(f"Warning: {w}\n", "warn") for w in t.warnings]
             ps.set_rich(self.summary, parts)
@@ -318,7 +321,9 @@ class PhantomApp:
 
         can_upload = connected and not probs and self.jumpers_ok.get() and not self.running
         on_device = t is not None and self.uploaded_checksum == t.checksum
-        self.upload_btn.configure(state=tk.NORMAL if can_upload else tk.DISABLED)
+        streamed = t is not None and connected and self.dev.needs_streaming(t)
+        self.upload_btn.configure(state=tk.NORMAL if can_upload else tk.DISABLED,
+                                  text="Fill stream buffer" if streamed else "Upload")
         self.arm_btn.configure(state=tk.NORMAL if (can_upload and on_device) else tk.DISABLED)
         for btn in (self.stop_btn, self.finish_btn, self.status_btn):
             btn.configure(state=tk.NORMAL if connected else tk.DISABLED)
@@ -447,8 +452,29 @@ class PhantomApp:
         elif line.startswith("EV DONE"):
             self.running = False
             self.state_label.configure(text="done: " + line[8:])
-            self._set_state("ready")
+            self._program_used()
+            self._set_state("ready" if self.uploaded_checksum is not None else "idle")
+        elif line.startswith("EV ABORT"):
+            self.running = False
+            self._program_used()
+            self._set_state("error")
+            self.state_badge.set("ABORTED", "error")
+            self.state_label.configure(text=line[9:])
+            self.log(line, "err")
+            pos = line.split("pos=")[1].split()[0] if "pos=" in line else "?"
+            reason = ("the controller ran out of streamed segments: this PC did not send them in time"
+                      if "underrun" in line else line[9:])
+            messagebox.showerror(
+                "Playback aborted",
+                f"The motion was stopped: {reason}.\n\nThe phantom stopped at {pos} microsteps from "
+                f"zero; jog it back before the next run. The MRI data acquired after the abort "
+                f"is not synchronized with the motion.", parent=self.root)
         self._refresh()
+
+    def _program_used(self) -> None:
+        """A streamed program is consumed by playing it: it must be streamed again."""
+        if self.dev is not None and self.dev.session is not None:
+            self.uploaded_checksum = None
 
     def _run(self, label: str, fn, done=None) -> None:
         """Run a blocking device call on a worker thread."""
@@ -490,10 +516,27 @@ class PhantomApp:
                                    parent=self.root)
             return
         traj, cycles, trigger = self.traj, self._cycles(), self.trigger
-        self.progress.configure(maximum=len(traj.segments), value=0)
-        self.uploaded_checksum = None  # LOAD invalidates the program on the device
+        self.uploaded_checksum = None  # LOAD/STREAM invalidates the program on the device
         self.upload_btn.configure(state=tk.DISABLED)
         self._set_state("loading")
+        if self.dev.needs_streaming(traj):
+            slots = int(self.dev.caps["max_segments"])
+            self.progress.configure(maximum=slots, value=0)
+            self.log(f"streaming {len(traj.segments)} segments per cycle (trigger {trigger}, cycles {cycles}); "
+                     f"filling the {slots}-segment buffer …")
+
+            def buffer_fill(sent, consumed):
+                self._post(self._show_buffer, sent - consumed, slots)
+
+            def streamed(_):
+                self.uploaded_checksum = traj.checksum
+                self.log("buffer filled: keep this PC connected while it plays", "ev")
+                self._set_state("ready")
+                self._refresh()
+
+            self._run("upload", lambda d: d.stream(traj, cycles, trigger, progress=buffer_fill), streamed)
+            return
+        self.progress.configure(maximum=len(traj.segments), value=0)
         self.log(f"uploading {len(traj.segments)} segments (trigger {trigger}, cycles {cycles}) …")
 
         def prog(i, n):
@@ -506,6 +549,12 @@ class PhantomApp:
             self._refresh()
 
         self._run("upload", lambda d: d.upload(traj, cycles, trigger, prog), done)
+
+    def _show_buffer(self, buffered: int, slots: int) -> None:
+        """Streaming: how many segments the device has in hand."""
+        self.progress.configure(maximum=slots, value=buffered)
+        if self.running:
+            self.state_label.configure(text=f"streaming · buffer {buffered}/{slots}")
 
     def arm(self) -> None:
         if not self.jumpers_ok.get():

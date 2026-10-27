@@ -137,3 +137,39 @@ def test_upload_and_run_on_emulator(app, shots, hex_path):
     finally:
         app.disconnect()
         emu.stop()
+
+
+def test_streamed_run_and_abort_alarm(app, hex_path, monkeypatch):
+    """A program larger than the ATmega's memory is streamed from the GUI; an
+    underrun abort turns the badge red and raises an alarm."""
+    alarms = []
+    monkeypatch.setattr("phantom_gui.messagebox.showerror", lambda *a, **k: alarms.append(a))
+    emu = emumod.AvrEmulator(hex_path, realtime=True).start()
+    try:
+        app.port_var.set(emu.url)
+        app.toggle_connect()
+        assert pump(app.root, lambda: app.dev is not None, timeout=15), "connect"
+        design = pc.Design(shape="sinusoid", amplitude_deg=10, length_ms=300, n_periods=5,
+                           length_spread_pct=10, amplitude_spread_pct=10, skew_jitter=0.1, delay_ms=50)
+        traj = pc.compile_design(design, pc.Limits(), app.dev.caps)
+        assert traj.metrics["streamed"]
+        app.set_trajectory(traj)
+        app.jumpers_ok.set(True)
+        app.trigger_label.set(TRIGGER_LABELS["now"])
+        app.cycles_var.set("1")
+        app._refresh()
+        assert "Streaming" in app.summary.get("1.0", "end")
+        assert str(app.upload_btn["text"]) == "Fill stream buffer"
+        app.upload()
+        assert pump(app.root, lambda: app.uploaded_checksum is not None, timeout=30), "fill"
+        app.arm()
+        assert pump(app.root, lambda: "done" in str(app.state_label["text"]), timeout=60), "run"
+        assert "pos=0" in str(app.state_label["text"])
+        assert app.uploaded_checksum is None  # streamed programs are used up
+        assert not alarms
+        app._on_event("EV ABORT underrun consumed=30 pos=57 cycles=0")
+        assert str(app.state_badge["text"]) == "ABORTED" and alarms
+        assert "57 microsteps" in alarms[0][1]
+    finally:
+        app.disconnect()
+        emu.stop()

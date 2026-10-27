@@ -20,6 +20,12 @@
 //   END <crc16>                            -> OK END <nseg> <crc16>
 //   ARM [trig] [cycles]                    -> OK ARM <trig>     (then EV START / EV DONE)
 //   STOP | FINISH | STATUS | ZERO | JOG <steps> <rate_hz>
+// Streaming (programs larger than the segment memory; the table becomes a ring):
+//   STREAM <tick_hz> <trig>                -> OK STREAM <slots>
+//   SS <count> <interval> <add> <add2> <flags> <crc16> -> SS <seq> | ERR SS <reason>
+//   CLOSE                                  -> OK CLOSE        (no more segments)
+//   while playing: EV FREE <consumed>; an empty ring before CLOSE aborts at once:
+//   EV ABORT underrun consumed=<n> pos=<p> cycles=<c>
 #include <Arduino.h>
 #include <stdlib.h>
 #include <string.h>
@@ -125,11 +131,15 @@ static const uint32_t kTickRates[] = {40000000UL, 10000000UL, 4000000UL, 2000000
 // ---------------------------------------------------------------------------
 enum : uint8_t { ST_IDLE, ST_LOADING, ST_READY, ST_ARMED, ST_RUNNING };
 enum : uint8_t { TRIG_NOW, TRIG_TTL, TRIG_BUTTON };
-enum : uint8_t { NOTE_START = 1, NOTE_DONE = 2 };
+enum : uint8_t { NOTE_START = 1, NOTE_DONE = 2, NOTE_UNDERRUN = 4 };
 
 static seg::Segment g_segs[MAX_SEGMENTS];
 static seg::Segment g_jog;
 static seg::Engine g_eng;
+static seg::Ring g_ring;
+static bool g_stream = false;       // the program is streamed into g_ring
+static uint32_t g_stream_seq = 0;   // segments accepted since STREAM
+static uint32_t g_reported = 0;     // consumed count last sent as EV FREE
 
 static uint16_t g_nseg = 0;       // segments announced by LOAD
 static uint16_t g_received = 0;   // segments received so far
@@ -163,8 +173,10 @@ static int parse_trigger(const char* s) {
 }
 
 // Prepare the engine and the first event; called with the timer interrupt idle.
+// segs == nullptr: play the stream ring.
 static void prepare_playback(const seg::Segment* segs, uint16_t n, uint32_t cycles) {
-    g_eng.begin(segs, n, cycles);
+    if (segs) g_eng.begin(segs, n, cycles);
+    else g_eng.begin_stream(&g_ring);
     seg::Event ev;
     g_eng.next(ev);
     g_kind = ev.kind;
@@ -197,18 +209,20 @@ static void set_tick_hz(uint32_t hz) {
 
 static void SEG_ISR_ATTR hw_stop();
 
-// Leave the running/armed state; `done` reports EV DONE to the host.
+// Leave the running/armed state; `done` reports EV DONE (or EV ABORT after a
+// stream underrun) to the host. A streamed program is used up.
 static void SEG_ISR_ATTR end_playback(bool done) {
     hw_stop();
+    if (g_stream) g_valid = false;
     g_state = g_valid ? ST_READY : ST_IDLE;
-    if (done) g_notes |= NOTE_DONE;
+    if (done) g_notes |= (g_kind == seg::EV_UNDERRUN) ? NOTE_UNDERRUN : NOTE_DONE;
 }
 
 // Fire the pending event and compute the next one (shared by both timer back
 // ends). Returns false when playback is over, else the delay in `ticks`.
 static inline SEG_ISR_ATTR bool fire_event(uint32_t& ticks) {
     uint8_t kind = g_kind;
-    if (kind == seg::EV_END) return false;
+    if (kind == seg::EV_END || kind == seg::EV_UNDERRUN) return false;
     uint32_t pulse_t0 = 0;
     if (kind == seg::EV_STEP) {
         STEP_HIGH();
@@ -222,6 +236,7 @@ static inline SEG_ISR_ATTR bool fire_event(uint32_t& ticks) {
         STEP_LOW();
     }
     g_kind = ev.kind;
+    if (ev.kind == seg::EV_UNDERRUN) return false;  // the next segment is not there: abort now
     if (ev.kind == seg::EV_STEP && ev.dir != g_dir_level) {
         g_dir_level = ev.dir;  // DIR changes after STEP fell, >= one event before the next step
         DIR_WRITE(ev.dir);
@@ -489,7 +504,7 @@ static void cmd_hello() {
     Serial.print(PIN_BUTTON);
     Serial.print(F(",\"mri\":"));
     Serial.print(PIN_MRI);
-    Serial.println(F("},\"ttl\":true,\"triggers\":[\"now\",\"ttl\",\"button\"]}"));
+    Serial.println(F("},\"ttl\":true,\"stream\":true,\"triggers\":[\"now\",\"ttl\",\"button\"]}"));
 }
 
 static void cmd_status() {
@@ -520,7 +535,20 @@ static void cmd_status() {
     Serial.print(F(" tick_hz="));
     Serial.print(g_tick_hz);
     Serial.print(F(" jog="));
-    Serial.println(g_jogging ? 1 : 0);
+    Serial.print(g_jogging ? 1 : 0);
+    Serial.print(F(" stream="));
+    Serial.print(g_stream ? 1 : 0);
+    if (g_stream) {
+        CRIT_BEGIN();
+        uint16_t buffered = g_ring.count;
+        uint32_t consumed = g_ring.consumed;
+        CRIT_END();
+        Serial.print(F(" buffered="));
+        Serial.print(buffered);
+        Serial.print(F(" consumed="));
+        Serial.print(consumed);
+    }
+    Serial.println();
 }
 
 static void cmd_load(char* args) {
@@ -537,6 +565,7 @@ static void cmd_load(char* args) {
     int tick = tick_index(hz);
     if (tick < 0) return reply_err(F("unsupported tick_hz"));
     g_valid = false;
+    g_stream = false;
     hw_set_tick((uint8_t)tick);
     g_nseg = (uint16_t)n;
     g_received = 0;
@@ -546,25 +575,82 @@ static void cmd_load(char* args) {
     Serial.println(F("OK LOAD"));
 }
 
-static void cmd_seg(char* args) {
-    if (g_state != ST_LOADING) return reply_err(F("not loading"));
-    if (g_received >= g_nseg) return reply_err(F("too many segments"));
-    char* tok[5];
-    for (uint8_t i = 0; i < 5; ++i) tok[i] = strtok(i ? nullptr : args, " ");
-    if (!tok[4]) return reply_err(F("usage: SEG <count> <interval> <add> <add2> <flags>"));
-    seg::Segment& s = g_segs[g_received];
+// Parse "<count> <interval> <add> <add2> <flags>" into s; *rest = the next token (or nullptr).
+static bool parse_segment(char* args, seg::Segment& s, char** rest) {
+    char* tok[6];
+    for (uint8_t i = 0; i < 6; ++i) tok[i] = strtok(i ? nullptr : args, " ");
+    if (!tok[4]) return false;
     s.count = (uint16_t)strtoul(tok[0], nullptr, 10);
     s.interval = (uint32_t)strtoul(tok[1], nullptr, 10);
     s.add = (int32_t)strtol(tok[2], nullptr, 10);
     s.add2 = (int32_t)strtol(tok[3], nullptr, 10);
     s.flags = (uint8_t)strtoul(tok[4], nullptr, 10);
+    if (rest) *rest = tok[5];
+    return true;
+}
+
+static void cmd_seg(char* args) {
+    if (g_state != ST_LOADING || g_stream) return reply_err(F("not loading"));
+    if (g_received >= g_nseg) return reply_err(F("too many segments"));
+    if (!parse_segment(args, g_segs[g_received], nullptr))
+        return reply_err(F("usage: SEG <count> <interval> <add> <add2> <flags>"));
     Serial.print(F("OK "));
     Serial.println(g_received);
     ++g_received;
 }
 
+static void cmd_stream(char* args) {
+    if (busy()) return reply_err(F("busy"));
+    char* a = strtok(args, " ");
+    char* b = strtok(nullptr, " ");
+    if (!b) return reply_err(F("usage: STREAM <tick_hz> <now|ttl|button>"));
+    int trig = parse_trigger(b);
+    if (trig < 0) return reply_err(F("bad trigger"));
+    int tick = tick_index(strtoul(a, nullptr, 10));
+    if (tick < 0) return reply_err(F("unsupported tick_hz"));
+    g_valid = false;
+    hw_set_tick((uint8_t)tick);
+    g_ring.reset(g_segs, MAX_SEGMENTS);
+    g_stream = true;
+    g_stream_seq = 0;
+    g_reported = 0;
+    g_nseg = 0;
+    g_cycles = 0;
+    g_trigger = (uint8_t)trig;
+    g_state = ST_LOADING;
+    Serial.print(F("OK STREAM "));
+    Serial.println(MAX_SEGMENTS);
+}
+
+// One streamed segment, protected by its own CRC (a corrupted line is refused).
+static void cmd_ss(char* args) {
+    if (!g_stream || !(g_state == ST_LOADING || busy())) return reply_err(F("SS no stream"));
+    if (g_ring.closed) return reply_err(F("SS closed"));
+    seg::Segment s;
+    char* crc_tok = nullptr;
+    if (!parse_segment(args, s, &crc_tok) || !crc_tok) return reply_err(F("SS usage"));
+    if (seg::crc16_segment(0xFFFF, s) != (uint16_t)strtoul(crc_tok, nullptr, 10))
+        return reply_err(F("SS crc"));
+    if (!g_ring.push_write(s)) return reply_err(F("SS full"));
+    {
+        CRIT_BEGIN();
+        g_ring.push_commit();
+        CRIT_END();
+    }
+    Serial.print(F("SS "));
+    Serial.println(g_stream_seq);
+    ++g_stream_seq;
+    g_valid = true;  // something to play
+}
+
+static void cmd_close() {
+    if (!g_stream) return reply_err(F("no stream"));
+    g_ring.closed = 1;
+    Serial.println(F("OK CLOSE"));
+}
+
 static void cmd_end(char* args) {
-    if (g_state != ST_LOADING) return reply_err(F("not loading"));
+    if (g_state != ST_LOADING || g_stream) return reply_err(F("not loading"));
     if (g_received != g_nseg) return reply_err(F("missing segments"));
     unsigned long want = strtoul(args, nullptr, 10);
     uint16_t crc = 0xFFFF;
@@ -596,7 +682,12 @@ static void cmd_arm(char* args) {
     if (c) g_cycles = strtoul(c, nullptr, 10);
     g_jogging = false;
     g_overruns = 0;
-    prepare_playback(g_segs, g_nseg, g_cycles);
+    if (g_stream) {
+        if (g_ring.count == 0) return reply_err(F("stream is empty"));
+        prepare_playback(nullptr, 0, 0);
+    } else {
+        prepare_playback(g_segs, g_nseg, g_cycles);
+    }
     g_state = ST_ARMED;
     Serial.print(F("OK ARM "));
     Serial.println(trigger_name(g_trigger));
@@ -635,7 +726,10 @@ static void handle_line(char* line) {
     char* sp = strchr(line, ' ');
     char* args = sp ? sp + 1 : line + strlen(line);
     if (sp) *sp = '\0';
-    if (!strcmp(line, "SEG")) cmd_seg(args);
+    if (!strcmp(line, "SS")) cmd_ss(args);
+    else if (!strcmp(line, "SEG")) cmd_seg(args);
+    else if (!strcmp(line, "STREAM")) cmd_stream(args);
+    else if (!strcmp(line, "CLOSE")) cmd_close();
     else if (!strcmp(line, "HELLO")) cmd_hello();
     else if (!strcmp(line, "STATUS")) cmd_status();
     else if (!strcmp(line, "LOAD")) cmd_load(args);
@@ -668,6 +762,20 @@ static char g_line[72];
 static uint8_t g_len = 0;
 static bool g_overflow = false;
 static uint8_t g_btn_count = 0;
+
+// Tell the host how many streamed segments the engine has taken: in batches of
+// an eighth of the ring, and every one once the ring is a quarter full or less.
+static void report_free() {
+    CRIT_BEGIN();
+    uint32_t consumed = g_ring.consumed;
+    uint16_t buffered = g_ring.count;
+    CRIT_END();
+    if (consumed == g_reported) return;
+    if (consumed - g_reported < MAX_SEGMENTS / 8 && buffered > MAX_SEGMENTS / 4) return;
+    g_reported = consumed;
+    Serial.print(F("EV FREE "));
+    Serial.println(consumed);
+}
 
 void setup() {
     Serial.begin(115200);
@@ -711,7 +819,16 @@ void loop() {
         g_notes = 0;
         CRIT_END();
     }
+    if (g_stream && g_state == ST_RUNNING) report_free();
     if (notes & NOTE_START) Serial.println(F("EV START"));
+    if (notes & NOTE_UNDERRUN) {
+        Serial.print(F("EV ABORT underrun consumed="));
+        Serial.print(g_ring.consumed);
+        Serial.print(F(" pos="));
+        Serial.print(g_pos);
+        Serial.print(F(" cycles="));
+        Serial.println(g_eng.cycle);
+    }
     if (notes & NOTE_DONE) {
         g_jogging = false;
         Serial.print(F("EV DONE cycles="));

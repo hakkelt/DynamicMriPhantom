@@ -157,8 +157,36 @@ trigger is `button`; `now` starts at the ARM command (debug).
 | `STOP` / `FINISH` | `OK STOP pos=…` / `OK FINISH` |
 | `STATUS` | `STATUS state=… cycle=… seg=… pos=… overruns=… …` |
 | `JOG <steps> <rate_hz>`, `ZERO` | `OK JOG` (then `EV DONE`), `OK ZERO` |
+| `STREAM <tick_hz> <now\|ttl\|button>` | `OK STREAM <slots>`: the segment memory becomes a ring |
+| `SS <count> <interval> <add> <add2> <flags> <crc16>` | `SS <seq>`, or `ERR SS crc\|full\|closed\|…` |
+| `CLOSE` | `OK CLOSE`: no more segments; an empty ring then ends the run normally |
+| (while streaming) | `EV FREE <consumed>`; `EV ABORT underrun consumed=… pos=… cycles=…` |
 
-The checksum is CRC-16/CCITT-FALSE over the packed little-endian segments.
+The checksum is CRC-16/CCITT-FALSE over the packed little-endian segments
+(for `SS`: over that one segment).
+
+### Streaming
+
+A program larger than the device memory is streamed while it plays.
+
+- **Firmware:** the segment table is used as a ring buffer. `SS` lines fill
+  it, and the first segment of each cycle carries flag `0x04` (CYCLE), so
+  `FINISH` still stops at a cycle boundary.
+- **Host:** `phantom_device.StreamSession` fills the ring before `ARM`, then a
+  thread sends a segment whenever the device reports a free slot
+  (`EV FREE`). It never has more unacknowledged bytes in flight than the
+  device's receive buffer.
+- **Underrun safeguard:** if the engine needs the next segment and the ring is
+  empty before `CLOSE`, the device stops at once and STEP stays low. It
+  reports `EV ABORT underrun consumed=… pos=… cycles=…` and goes idle. The GUI
+  turns the badge red and raises an alarm with the position.
+- **Host-side failures:** a refused or unanswered line stops the device and
+  is reported as `EV ABORT host <reason>`.
+- **Planner:** streams only when nothing fits in memory at the chosen
+  microstep. It models the link (115200 baud, 5 ms round trip, receive
+  window) and the deadline of every segment, and requires a worst-case margin
+  of `min_stream_slack_ms` (default 300 ms). A PC stall longer than that
+  margin aborts the run. It picks the tick with the largest margin.
 
 ### Compiled trajectory file (`.phtraj`, JSON)
 
@@ -170,10 +198,15 @@ and the device capabilities it was compiled for.
 ## Limits worth knowing
 
 - **ATmega328PB memory**: 72 segments (1080 bytes of the 2 KB RAM). One
-  smooth period at 1/32 microstepping needs about 30–70 segments, so
-  irregular sequences with several periods fall back to a lower microstep.
-  The designer shows what was tried. Use the ESP32 (4096 segments) for long
-  irregular sequences, or raise the tolerance.
+  smooth period at 1/32 microstepping needs about 30–70 segments.
+  - Irregular sequences with several periods (100–400 segments) are
+    **streamed**; typical margins are 0.75–3.7 s.
+  - The PC must stay connected for the whole scan. Use the ESP32 (4096
+    segments) to keep them on the board.
+  - Set `allow_streaming=False` to fall back to a lower microstep instead.
+- **While streaming on the ATmega**, each received byte runs the USART
+  interrupt (~3.5 µs), so about 1 % of steps come up to ~7 µs late (never
+  accumulating).
 - **Measured in the emulator (AVR)**:
   - trigger latency: constant 6.9 µs (reported in CAPS)
   - step jitter: < 0.5 µs; up to ~2 µs while the controller is sending a
@@ -248,6 +281,8 @@ xvfb-run -a python -m pytest -v        # or plain pytest without the GUI tests
 - `test_emulator.py`: the real firmware on both emulated boards (each test
   runs for `atmega328p` and `esp32s3`):
   - TTL/now/button triggers, and that only the first TTL edge counts
+  - streaming through a small ring (exact steps), FINISH, underrun abort with
+    the reported position, a host stall, corrupted lines refused
   - every step time against the plan (constant latency, < 1 µs jitter)
   - pulse width and DIR setup
   - exact cycle length, FINISH/STOP/JOG, protocol errors

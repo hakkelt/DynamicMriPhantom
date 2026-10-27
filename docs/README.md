@@ -163,6 +163,35 @@ Each compare value is set relative to the previous one, so interrupt latency
 never accumulates. A compare that would already be in the past is counted as
 an **overrun** (reported in `STATUS` and `EV DONE`; it should always be 0).
 
+## Streaming long sequences
+
+The ATmega holds 72 segments; an irregular sequence with several periods needs
+100–400. Those are streamed: the segment memory becomes a ring that the PC keeps
+filled while the motor plays.
+
+```mermaid
+sequenceDiagram
+  participant PC as PC (StreamSession)
+  participant C as Controller
+  participant M as MRI
+  PC->>C: STREAM, SS × 72 (fill the ring)
+  PC->>C: ARM ttl
+  M-->>C: TTL rising edge (t = 0)
+  loop while playing
+    C-->>PC: EV FREE <consumed>
+    PC->>C: SS … (one per free slot, each with its CRC)
+  end
+  PC->>C: CLOSE (finite run or FINISH)
+  C-->>PC: EV DONE
+  Note over C: ring empty before CLOSE:<br/>stop at once, STEP low
+  C-->>PC: EV ABORT underrun pos=…
+```
+
+The planner only streams what does not fit, and only if the PC can never fall
+behind by less than **300 ms** (it simulates the link and every segment's
+deadline). If the PC still stalls longer, the controller aborts instead of
+playing a wrong motion, and the GUI raises an alarm with the position.
+
 ## Ground truth
 
 **Export ground truth…** in the main window writes one cycle as CSV:
@@ -176,7 +205,8 @@ the emulator test checks it against the measured STEP edges (< 1 µs).
 | TTL edge → planned step time | +7 µs, constant (`trigger_latency_us` in CAPS) |
 | Step timing jitter | < 0.5 µs; up to ~2 µs while the controller sends a serial message (it never accumulates) |
 | STEP pulse width | ~23 µs (drivers need ≥ 1.9 µs) |
-| Segment memory | 72 segments (one smooth period at 1/32 ≈ 30–70) |
+| Segment memory | 72 segments (one smooth period at 1/32 ≈ 30–70); larger programs are streamed |
+| Step jitter while streaming | ~1 % of steps up to ~7 µs late (serial receive interrupt) |
 
 The ESP32-S3 back end passes the same end-to-end tests in a host simulation
 (steps exactly on plan, no jitter in the model). Its interrupt latencies are

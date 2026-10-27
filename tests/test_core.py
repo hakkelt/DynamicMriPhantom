@@ -232,3 +232,58 @@ def test_curves_shapes():
     assert len(c["t"]) == len(c["ideal_deg"]) == len(c["real_deg"])
     assert np.abs(c["error_deg"]).max() <= traj.metrics["max_position_error_deg"] + 1e-6
     assert c["real_deg"][-1] == 0
+
+
+IRREGULAR = pc.Design(shape="sinusoid", amplitude_deg=30, length_ms=1000, n_periods=5, length_spread_pct=20,
+                      amplitude_spread_pct=20, skew_jitter=0.2, delay_ms=50, delay_spread_pct=20)
+
+
+def test_planner_streams_only_what_does_not_fit():
+    caps = board_caps("atmega328pb")
+    small = pc.compile_design(pc.Design(amplitude_deg=30), pc.Limits(), caps)
+    assert not small.metrics["streamed"] and len(small.segments) <= caps["max_segments"]
+    big = pc.compile_design(IRREGULAR, pc.Limits(), caps)
+    assert big.microstep == 32 and len(big.segments) > caps["max_segments"]
+    m = big.metrics
+    assert m["streamed"] and m["stream_slack_ms"] >= 300 and m["stream_link_load"] <= pc.STREAM_MAX_LINK_LOAD
+    assert any(w.startswith("streamed") for w in big.warnings)
+    assert pc.compatibility_problems(big, caps) == []
+    # without streaming the same design needs a lower microstep, or does not fit at all
+    res = pc.plan(IRREGULAR, pc.Limits(allow_streaming=False), caps)
+    assert res.trajectory is None or res.trajectory.microstep < 32
+    assert pc.compatibility_problems(big, {**caps, "stream": False})
+
+
+def test_stream_slack_model():
+    caps = board_caps("atmega328pb")
+    big = pc.compile_design(IRREGULAR, pc.Limits(), caps)
+    args = (big.segments, big.tick_hz, big.total_ticks)
+    base = pc.stream_slack(*args, caps)
+    # a slower link, a smaller buffer or a slower host leave less margin
+    assert pc.stream_slack(*args, caps, baudrate=9600)["slack_ms"] < base["slack_ms"]
+    assert pc.stream_slack(*args, {**caps, "max_segments": 16})["slack_ms"] < base["slack_ms"]
+    assert pc.stream_slack(*args, caps, latency_s=0.05)["slack_ms"] < base["slack_ms"]
+    assert pc.stream_slack(*args, caps, baudrate=9600)["link_load"] > 1  # cannot keep up at all
+    # a margin requirement the design cannot meet makes the planner refuse to stream
+    strict = pc.Limits(min_stream_slack_ms=1e6, allowed_microsteps=[32])
+    res = pc.plan(IRREGULAR, strict, caps)
+    assert res.trajectory is None and any("streaming margin" in a["result"] for a in res.attempts)
+
+
+def test_segment_entry_ticks_are_deadlines():
+    """The engine takes segment k at the time of the last step before it."""
+    traj = pc.compile_design(IRREGULAR, pc.Limits(), board_caps("esp32s3"))
+    entry = pc.segment_entry_ticks(traj.segments)
+    steps = traj.events[0][traj.events[1] == pc.EV_STEP]
+    ends = np.cumsum([0 if s[4] & pc.FLAG_WAIT else s[0] for s in traj.segments])
+    for k in range(1, len(traj.segments)):
+        last = steps[ends[k - 1] - 1] if ends[k - 1] else 0
+        assert entry[k] == pytest.approx(last, abs=2)
+
+
+def test_stream_line_crc():
+    seg = (12, 6553600, -3, 1, pc.FLAG_DIR)
+    line = pc.stream_line(seg, cycle_start=True)
+    c, i, a, a2, f, crc = map(int, line.split()[1:])
+    assert f == pc.FLAG_DIR | pc.FLAG_CYCLE
+    assert crc == pc.crc16_ccitt(pc.pack_segment((c, i, a, a2, f)))

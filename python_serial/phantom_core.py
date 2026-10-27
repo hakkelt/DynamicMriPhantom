@@ -46,6 +46,7 @@ FRAC_BITS = 16
 FRAC_ONE = 1 << FRAC_BITS
 FLAG_DIR = 0x01
 FLAG_WAIT = 0x02
+FLAG_CYCLE = 0x04  # streaming: first segment of a cycle (frac reset, cycle count)
 SEGMENT_BYTES = 15  # packed size on the device
 MAX_INTERVAL_FP = 0xFFFF0000  # keeps frac + interval inside 32 bits
 MAX_COUNT = 0xFFFF
@@ -58,6 +59,7 @@ MAX_ABS_SKEW = 0.95
 EV_DELAY = 0
 EV_STEP = 1
 EV_END = 2
+EV_UNDERRUN = 3  # streaming: the next segment had not arrived (the device aborts)
 
 # ----------------------------------------------------------------------------
 # Drivers and microstep jumpers
@@ -116,7 +118,7 @@ DEFAULT_CAPS = {
         "max_step_rate_hz": 20_000, "min_event_us": 40.0,
         "step_pulse_us": 3.0, "dir_setup_us": 1.0, "trigger_latency_us": 7.0,
         "pins": {"dir": 2, "step": 3, "button": 5, "mri": 6},
-        "ttl": True, "triggers": ["now", "ttl", "button"],
+        "ttl": True, "stream": True, "triggers": ["now", "ttl", "button"],
     },
     "esp32s3": {
         "fw": "segment_player", "version": "1.0.0", "protocol": PROTOCOL_VERSION,
@@ -126,7 +128,7 @@ DEFAULT_CAPS = {
         "max_step_rate_hz": 50_000, "min_event_us": 12.0,
         "step_pulse_us": 3.0, "dir_setup_us": 1.0, "trigger_latency_us": 2.0,
         "pins": {"dir": 5, "step": 6, "button": 8, "mri": 9},
-        "ttl": True, "triggers": ["now", "ttl", "button"],
+        "ttl": True, "stream": True, "triggers": ["now", "ttl", "button"],
     },
 }
 
@@ -159,6 +161,10 @@ class Limits:
     max_accel_dps2: float = 50_000.0
     start_stop_speed_dps: float = 90.0
     tolerance_us: float = 10.0
+    # A program larger than the device memory may be streamed while it plays,
+    # if the device can never run dry by less than this margin (see stream_slack).
+    allow_streaming: bool = True
+    min_stream_slack_ms: float = 300.0
 
 
 @dataclass
@@ -681,6 +687,92 @@ def segments_checksum(segs) -> int:
 
 
 # ----------------------------------------------------------------------------
+# Streaming (programs larger than the device memory)
+# ----------------------------------------------------------------------------
+
+STREAM_LINK_LATENCY_S = 0.005  # one host <-> device round trip (USB serial + OS scheduling)
+STREAM_MAX_LINK_LOAD = 0.8     # the link must not be busier than this on average
+STREAM_REPLY_BYTES = len("SS 4294967295\r\n")
+
+
+def stream_line(seg, cycle_start: bool = False) -> str:
+    """The SS line streaming ``seg``; the first segment of a cycle gets FLAG_CYCLE."""
+    c, i, a, a2, f = seg
+    s = (c, i, a, a2, f | (FLAG_CYCLE if cycle_start else 0))
+    return "SS {} {} {} {} {} {}".format(*s, crc16_ccitt(pack_segment(s)))
+
+
+def segment_entry_ticks(segments) -> np.ndarray:
+    """Tick (from the cycle start) at which the engine takes each segment of a cycle.
+
+    The engine takes segment k while computing the event after the last step
+    of the segments before it, i.e. at that step's time (WAITs are taken
+    together with the segment after them). That is the deadline for k to be
+    in the device's buffer.
+    """
+    out = np.empty(len(segments))
+    t = last = 0.0
+    for k, (c, i, a, a2, f) in enumerate(segments):
+        out[k] = last
+        if f & FLAG_WAIT:
+            t += i
+        elif c:
+            n = float(c)
+            t += (n * i + a * n * (n - 1) / 2 + a2 * n * (n - 1) * (n - 2) / 6) / FRAC_ONE
+            last = t
+    return out
+
+
+def stream_slack(segments, tick_hz: float, total_ticks: int, caps: dict, cycles: int = 3,
+                 latency_s: float = STREAM_LINK_LATENCY_S, baudrate: int = 115200) -> dict:
+    """How early the streamed segments reach the device compared with when it needs them.
+
+    Model: the device holds ``caps['max_segments']`` segments, filled before the
+    start. The host sends one line as soon as a slot is free and it knows about
+    it (the device's EV FREE report arrives ``latency_s`` after the slot frees),
+    with at most ``caps['rx_buffer']`` bytes of SS lines unacknowledged. Returns
+    ``slack_ms`` (smallest margin before a segment is needed, over ``cycles``
+    cycles; a host stall longer than this aborts the run) and ``link_load``
+    (fraction of the link the stream needs on average).
+    """
+    slots = int(caps["max_segments"])
+    n = len(segments)
+    lines = [len(stream_line(s, k == 0)) + 1 for k, s in enumerate(segments)]
+    byte_s = 10.0 / baudrate
+    line_s = np.array(lines) * byte_s
+    window = max(1, (int(caps.get("rx_buffer", 64)) - 8) // max(lines))
+    # time the host spends per line: pipelined, or waiting for each reply
+    per_line = np.maximum(line_s, (line_s + STREAM_REPLY_BYTES * byte_s + latency_s) / window)
+    cycle_s = total_ticks / tick_hz
+    entry = segment_entry_ticks(segments) / tick_hz
+    total = n * cycles
+    deadline = np.concatenate([entry + k * cycle_s for k in range(cycles)])
+    slack = math.inf
+    send = -math.inf
+    for k in range(slots, total):
+        free_known = deadline[k - slots] + latency_s
+        send = max(send + per_line[k % n], free_known)
+        arrival = send + line_s[k % n]
+        slack = min(slack, deadline[k] - arrival)
+    return {"slack_ms": slack * 1000.0, "link_load": float(per_line.sum() / cycle_s)}
+
+
+def stream_problem(segments, tick_hz, total_ticks, caps: dict, limits: "Limits") -> Optional[str]:
+    """None if a program that does not fit in the device can be streamed safely."""
+    if not caps.get("stream"):
+        return f"{len(segments)} segments, device holds {caps.get('max_segments')} and cannot stream"
+    if not limits.allow_streaming:
+        return f"{len(segments)} segments, device holds {caps.get('max_segments')} (streaming not allowed)"
+    st = stream_slack(segments, tick_hz, total_ticks, caps)
+    if st["link_load"] > STREAM_MAX_LINK_LOAD:
+        return f"streaming needs {st['link_load']:.0%} of the serial link (max {STREAM_MAX_LINK_LOAD:.0%})"
+    if st["slack_ms"] < limits.min_stream_slack_ms:
+        return (f"streaming margin {st['slack_ms']:.0f} ms is below {limits.min_stream_slack_ms:.0f} ms "
+                f"({len(segments)} segments, device holds {caps.get('max_segments')})")
+    return None
+
+
+# ----------------------------------------------------------------------------
 # Compiled trajectory
 # ----------------------------------------------------------------------------
 
@@ -851,7 +943,16 @@ def compute_metrics(traj: CompiledTrajectory, ver: Verification, tau, dirs) -> d
         "max_position_error_deg": float(pos_err_max),
         "amplitude_quantization_deg": float(max(abs(q - p.amplitude_deg) for q, p in
                                                 zip(quantized_amplitudes_deg(periods, ms), periods))),
+        **stream_metrics(traj),
     }
+
+
+def stream_metrics(traj: "CompiledTrajectory") -> dict:
+    caps = traj.device_caps
+    if len(traj.segments) <= caps.get("max_segments", 0):
+        return {"streamed": False}
+    st = stream_slack(traj.segments, traj.tick_hz, traj.total_ticks, caps)
+    return {"streamed": True, "stream_slack_ms": st["slack_ms"], "stream_link_load": st["link_load"]}
 
 
 def trajectory_curves(traj: CompiledTrajectory, n_cycles: int = 1, per_period: int = 1500):
@@ -942,6 +1043,10 @@ def limit_warnings(design: Design, limits: Limits, periods, metrics: dict) -> li
     if design.shape == "triangle":
         w.append(f"triangle reverses instantly at the peak (speed jumps by up to "
                  f"{2 * metrics['max_turn_speed_dps']:.0f} deg/s); check for lost steps")
+    if metrics.get("streamed"):
+        w.append(f"streamed: {metrics['n_segments']} segments do not fit in the device, so the PC sends "
+                 f"them while it plays and must stay connected; a PC stall longer than "
+                 f"{metrics['stream_slack_ms']:.0f} ms aborts the run")
     if metrics["amplitude_quantization_deg"] > 1e-9:
         w.append(f"amplitude rounded to whole microsteps (up to "
                  f"{metrics['amplitude_quantization_deg']:.4f} deg)")
@@ -949,7 +1054,11 @@ def limit_warnings(design: Design, limits: Limits, periods, metrics: dict) -> li
 
 
 def plan(design: Design, limits: Limits, caps: dict, periods: Optional[list[Period]] = None) -> PlanResult:
-    """Choose the largest microstep and finest tick that the device can play."""
+    """Choose the largest microstep and finest tick that the device can play.
+
+    A program that fits in the device memory always wins over streaming at the
+    same microstep; a streamed one needs ``limits.min_stream_slack_ms`` margin.
+    """
     if periods is None:
         periods = generate_periods(design)
     allowed = limits.allowed_microsteps or driver_microsteps(limits.driver)
@@ -969,33 +1078,62 @@ def plan(design: Design, limits: Limits, caps: dict, periods: Optional[list[Peri
             attempts.append({"microstep": ms, "tick_hz": None,
                              "result": f"peak step rate {rate:.0f} Hz > {max_rate:.0f} Hz"})
             continue
-        for tick in sorted(caps["tick_hz"], reverse=True):
-            if 1e6 / tick > limits.tolerance_us:
+        # Prefer a program that fits in the device (finest tick first). Stream
+        # only if none does, then with the tick that leaves the largest margin.
+        modes = [False] + ([True] if limits.allow_streaming and caps.get("stream") else [])
+        for streamed in modes:
+            best = None
+            for tick in sorted(caps["tick_hz"], reverse=True):
+                label = "stream: " if streamed else ""
+                if 1e6 / tick > limits.tolerance_us:
+                    if not streamed:
+                        attempts.append({"microstep": ms, "tick_hz": tick,
+                                         "result": f"tick {1e6 / tick:.1f} us coarser than the tolerance"})
+                    continue
+                total_ticks = int(round(total_s * tick))
+                if total_ticks >= 2 ** 32:
+                    if not streamed:
+                        attempts.append({"microstep": ms, "tick_hz": tick, "result": "cycle too long for 32-bit ticks"})
+                    continue
+                tp = timing_params(caps, tick, limits.tolerance_us)
+                tau = t * tick
+                try:
+                    segs = fit_segments(tau, d, total_ticks, tp, None if streamed else caps["max_segments"])
+                    if streamed:
+                        why = stream_problem(segs, tick, total_ticks, caps, limits)
+                        if why:
+                            raise FitError(why)
+                    ver = verify_segments(segs, tau, d, total_ticks, tp)
+                except FitError as exc:
+                    attempts.append({"microstep": ms, "tick_hz": tick, "result": label + str(exc)})
+                    continue
+                if streamed:
+                    slack = stream_slack(segs, tick, total_ticks, caps)["slack_ms"]
+                    attempts.append({"microstep": ms, "tick_hz": tick,
+                                     "result": f"stream: possible, {len(segs)} segments, margin {slack:.0f} ms"})
+                    if best is None or slack > best[0]:
+                        best = (slack, tick, segs, total_ticks, ver, tau)
+                    continue
+                attempts.append({"microstep": ms, "tick_hz": tick, "result": f"ok, {len(segs)} segments"})
+                return PlanResult(_finish_plan(design, limits, caps, periods, ms, tick, segs, total_ticks,
+                                               ver, tau, d), attempts)
+            if best is not None:
+                _, tick, segs, total_ticks, ver, tau = best
                 attempts.append({"microstep": ms, "tick_hz": tick,
-                                 "result": f"tick {1e6 / tick:.1f} us coarser than the tolerance"})
-                continue
-            total_ticks = int(round(total_s * tick))
-            if total_ticks >= 2 ** 32:
-                attempts.append({"microstep": ms, "tick_hz": tick, "result": "cycle too long for 32-bit ticks"})
-                continue
-            tp = timing_params(caps, tick, limits.tolerance_us)
-            tau = t * tick
-            try:
-                segs = fit_segments(tau, d, total_ticks, tp, caps["max_segments"])
-                ver = verify_segments(segs, tau, d, total_ticks, tp)
-            except FitError as exc:
-                attempts.append({"microstep": ms, "tick_hz": tick, "result": str(exc)})
-                continue
-            attempts.append({"microstep": ms, "tick_hz": tick, "result": f"ok, {len(segs)} segments"})
-            traj = CompiledTrajectory(design=design, limits=limits, periods=periods, microstep=ms,
-                                      tick_hz=int(tick), segments=segs, total_ticks=total_ticks,
-                                      device_caps=dict(caps),
-                                      created=time.strftime("%Y-%m-%dT%H:%M:%S"))
-            traj.__dict__["events"] = ver.events  # prime the cached simulation
-            traj.metrics = compute_metrics(traj, ver, tau, d)
-            traj.warnings = limit_warnings(design, limits, periods, traj.metrics)
-            return PlanResult(traj, attempts)
+                                 "result": f"ok, {len(segs)} segments, streamed"})
+                return PlanResult(_finish_plan(design, limits, caps, periods, ms, tick, segs, total_ticks,
+                                               ver, tau, d), attempts)
     return PlanResult(None, attempts, "no microstep/tick combination fits the device")
+
+
+def _finish_plan(design, limits, caps, periods, ms, tick, segs, total_ticks, ver, tau, d):
+    traj = CompiledTrajectory(design=design, limits=limits, periods=periods, microstep=ms,
+                              tick_hz=int(tick), segments=segs, total_ticks=total_ticks,
+                              device_caps=dict(caps), created=time.strftime("%Y-%m-%dT%H:%M:%S"))
+    traj.__dict__["events"] = ver.events  # prime the cached simulation
+    traj.metrics = compute_metrics(traj, ver, tau, d)
+    traj.warnings = limit_warnings(design, limits, periods, traj.metrics)
+    return traj
 
 
 def compile_design(design: Design, limits: Limits, caps: dict, periods=None) -> CompiledTrajectory:
@@ -1021,7 +1159,9 @@ def compatibility_problems(traj: CompiledTrajectory, caps: dict) -> list[str]:
     if traj.tick_hz not in [int(x) for x in caps.get("tick_hz", [])]:
         p.append(f"tick rate {traj.tick_hz} Hz not offered by the device")
     if len(traj.segments) > caps.get("max_segments", 0):
-        p.append(f"{len(traj.segments)} segments, device holds {caps.get('max_segments')}")
+        why = stream_problem(traj.segments, traj.tick_hz, traj.total_ticks, caps, traj.limits)
+        if why:
+            p.append(why)
     rate = traj.metrics.get("peak_step_rate_hz", 0)
     if rate > caps.get("max_step_rate_hz", 0):
         p.append(f"peak step rate {rate:.0f} Hz above device limit {caps.get('max_step_rate_hz')} Hz")

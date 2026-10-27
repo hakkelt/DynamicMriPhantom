@@ -23,9 +23,9 @@ def engine_host(tmp_path_factory):
     return str(exe)
 
 
-def run_host(exe, segs, cycles):
+def run_host(exe, segs, cycles, *args):
     lines = [f"{len(segs)} {cycles}"] + [" ".join(str(v) for v in s) for s in segs]
-    out = subprocess.run([exe], input="\n".join(lines) + "\n", capture_output=True, text=True,
+    out = subprocess.run([exe, *map(str, args)], input="\n".join(lines) + "\n", capture_output=True, text=True,
                          check=True).stdout.split("\n")
     crc = int(out[0].split()[1])
     rows = np.array([[int(x) for x in ln.split()] for ln in out[1:] if ln.strip()], dtype=np.int64)
@@ -72,3 +72,26 @@ def test_edge_cases_bit_identical(engine_host):
     crc, rows = run_host(engine_host, waits_only, 3)
     times, kinds, _ = pc.simulate_engine(waits_only, 3)
     assert np.array_equal(rows[:, 0], times) and np.array_equal(rows[:, 1], kinds)
+
+
+@pytest.mark.parametrize("name", ["sinusoid", "gaussian_irregular"])
+@pytest.mark.parametrize("slots", [3, 16])
+def test_stream_bit_identical(engine_host, name, slots):
+    """Streaming through a small ring plays exactly the resident program."""
+    design, board = PROGRAMS[name]
+    traj = pc.compile_design(design, pc.Limits(), board_caps(board))
+    _, rows = run_host(engine_host, traj.segments, 3, "stream", slots, 0)
+    times, kinds, _ = pc.simulate_engine(traj.segments, 3)
+    assert np.array_equal(rows[:, 0], times) and np.array_equal(rows[:, 1], kinds)
+
+
+def test_stream_underrun(engine_host):
+    """A stream that runs dry before it is closed ends with EV_UNDERRUN after
+    exactly the steps it had (the firmware aborts at that event)."""
+    design, board = PROGRAMS["sinusoid"]
+    segs = pc.compile_design(design, pc.Limits(), board_caps(board)).segments
+    k = len(segs) // 2
+    _, rows = run_host(engine_host, segs, 2, "stream", 4, k)
+    times, kinds, _ = pc.simulate_engine(segs[:k], 1)
+    assert rows[-1, 1] == pc.EV_UNDERRUN
+    assert np.array_equal(rows[rows[:, 1] == pc.EV_STEP, 0], times[kinds == pc.EV_STEP])
