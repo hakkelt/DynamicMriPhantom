@@ -20,7 +20,7 @@ The motion is therefore known to the microsecond relative to the TTL.
 |---|---|
 | [Overview](docs/index.md) | System, scan workflow, quick start, hardware |
 | [Trajectory format](docs/trajectory.md) | Shapes, step placement, the 15-byte segments, `.phtraj` files |
-| [Main window](docs/gui.md) | Connecting, jumpers, triggers, upload/arm/stop, streaming, ground truth export |
+| [Main window](docs/gui.md) | Connecting, microstep mode pins, triggers, upload/arm/stop, streaming, ground truth export |
 | [Trajectory designer](docs/designer.md) | Parameters, plots, and how microstep, tick and segments are optimized |
 | [Firmware](docs/firmware.md) | Timer player, state machine, serial protocol, streaming, timing, emulators |
 
@@ -35,7 +35,8 @@ python python_serial/phantom_gui.py
    main window**.
 2. Select the port and **Connect**. The trajectory is checked against the
    device.
-3. Set the microstep jumpers as shown and tick **Jumpers are set as shown**.
+3. Set the driver's microstep mode pins (DIP switch or jumpers) as shown and
+   tick **Mode pins are set as shown**.
 4. Keep the trigger on **MRI TTL**, set the cycles, **Upload**, **Arm / Start**,
    then start the sequence.
 5. **Export ground truth…** writes the position after every step vs the time

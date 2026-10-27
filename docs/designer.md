@@ -28,7 +28,7 @@ the step placement are described in [Trajectory format](trajectory.md).
   as dashed lines.
 - **Result** tab: the chosen microstep, tick, segment count and memory,
   streaming margin, peak speed, acceleration and step rate, max timing and
-  position errors, jumper setting, warnings, and every combination the
+  position errors, mode-pin setting, warnings, and every combination the
   planner tried.
 - **Periods** tab: the generated per-period table.
 - **Save…** a `.phtraj`, or **Use in main window →**.

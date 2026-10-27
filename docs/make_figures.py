@@ -265,8 +265,8 @@ def ground_truth():
 
 # Numbered callouts on the main window screenshot (pixel positions in gui_main.png,
 # which is kept from the GUI test: PHANTOM_SCREENSHOT_DIR=... pytest tests/test_gui.py).
-MAIN_CALLOUTS = [(510, 42), (1062, 70), (408, 132), (600, 172), (262, 680), (900, 180), (960, 383),
-                 (1000, 452), (1010, 592), (805, 635), (600, 767)]
+MAIN_CALLOUTS = [(510, 42), (1062, 70), (408, 132), (600, 172), (262, 678), (900, 190), (960, 381),
+                 (1000, 450), (1010, 590), (805, 633), (600, 765)]
 
 
 def annotate_main():

@@ -1,5 +1,5 @@
 """Main window: connect to the phantom controller, load/upload a compiled
-trajectory, confirm the microstep jumpers, arm/start/stop.
+trajectory, confirm the microstep mode pins, arm/start/stop.
 
     python phantom_gui.py [--port /dev/ttyUSB0 | socket://127.0.0.1:5555]
 
@@ -16,6 +16,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 from tkinter.scrolledtext import ScrolledText
 from typing import Optional
 
@@ -117,7 +118,7 @@ class PhantomApp:
         # Right: jumpers and run control.
         side = ttk.Frame(body)
         side.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        jf = ps.card(side, "Microstep jumpers", fill=tk.X)
+        jf = ps.card(side, "Microstep mode pins", fill=tk.X)
         row = ttk.Frame(jf, style="Card.TFrame")
         row.pack(fill=tk.X)
         ttk.Label(row, text="Driver", style="Card.TLabel").pack(side=tk.LEFT)
@@ -125,13 +126,13 @@ class PhantomApp:
         ttk.Combobox(row, textvariable=self.driver_var, values=list(pc.DRIVERS), state="readonly",
                      width=10).pack(side=tk.LEFT, padx=6)
         self.driver_var.trace_add("write", lambda *_: self._driver_changed())
-        self.jumper_canvas = tk.Canvas(jf, width=300, height=74, background=ps.SURFACE,
+        self.jumper_canvas = tk.Canvas(jf, width=300, height=88, background=ps.SURFACE,
                                        highlightthickness=0)
         self.jumper_canvas.pack(fill=tk.X, pady=(8, 2))
         self.jumper_label = ttk.Label(jf, text="", wraplength=300, justify=tk.LEFT, style="Muted.TLabel")
         self.jumper_label.pack(fill=tk.X, pady=(0, 4))
         self.jumpers_ok = tk.BooleanVar(value=False)
-        self.jumper_check = ttk.Checkbutton(jf, text="Jumpers are set as shown", variable=self.jumpers_ok,
+        self.jumper_check = ttk.Checkbutton(jf, text="Mode pins are set as shown", variable=self.jumpers_ok,
                                             command=self._refresh)
         self.jumper_check.pack(anchor="w")
 
@@ -198,23 +199,35 @@ class PhantomApp:
             self.log_text.tag_configure(tag, foreground=color)
 
     def _draw_jumpers(self, driver: str, microstep: Optional[int]) -> None:
-        """Mode pins as jumper headers: a filled block = jumper fitted (HIGH)."""
+        """Mode pins as a DIP switch: knob up = ON (HIGH), down = OFF (LOW).
+
+        Works for any driver in ``pc.DRIVERS``; a jumper header reads the same
+        way (jumper fitted = ON)."""
         c = self.jumper_canvas
         c.delete("all")
         info = pc.DRIVERS[driver]
+        pins = info["pins"]
         levels = info["table"].get(microstep) if microstep else None
-        for i, pin in enumerate(info["pins"]):
-            x = 40 + i * 90
-            c.create_text(x + 14, 10, text=pin, fill=ps.MUTED, font=("TkDefaultFont", 9, "bold"))
-            for dy in (0, 22):
-                c.create_oval(x + 8, 22 + dy, x + 20, 34 + dy, outline="#9aa5b1", width=2)
+        family = tkfont.nametofont("TkDefaultFont").actual("family")
+        slot_w, slot_h, pitch, top, x0 = 24, 40, 64, 18, 4
+        c.create_rectangle(x0, top, x0 + 34 + len(pins) * pitch, top + slot_h + 12, fill="#334155",
+                           outline="#1e293b")
+        c.create_text(x0 + 8, top + 6, text="ON", anchor="nw", fill="#e2e8f0", font=(family, 8))
+        c.create_text(x0 + 8, top + slot_h + 6, text="OFF", anchor="sw", fill="#94a3b8", font=(family, 8))
+        for i, pin in enumerate(pins):
+            x = x0 + 40 + i * pitch
+            cx = x + slot_w / 2
+            c.create_text(cx, 8, text=pin, fill=ps.TEXT, font=(family, 9, "bold"))
+            c.create_rectangle(x, top + 6, x + slot_w, top + 6 + slot_h, fill="#0f172a", outline="#475569")
             if levels is None:
+                c.create_text(cx, top + 6 + slot_h / 2, text="?", fill="#94a3b8", font=(family, 10, "bold"))
                 continue
-            if levels[i]:
-                c.create_rectangle(x + 2, 18, x + 26, 60, fill=ps.ACCENT, outline=ps.ACCENT_DARK, width=1)
-                c.create_text(x + 14, 39, text="ON", fill="#ffffff", font=("TkDefaultFont", 8, "bold"))
-            c.create_text(x + 14, 68, text="HIGH" if levels[i] else "open",
-                          fill=ps.ACCENT if levels[i] else ps.MUTED, font=("TkDefaultFont", 8))
+            on = bool(levels[i])
+            ky = top + 8 if on else top + 6 + slot_h / 2
+            c.create_rectangle(x + 2, ky, x + slot_w - 2, ky + slot_h / 2 - 2,
+                               fill=ps.ACCENT if on else "#e2e8f0", outline=ps.ACCENT_DARK if on else "#94a3b8")
+            c.create_text(cx, top + slot_h + 22, text="HIGH" if on else "LOW",
+                          fill=ps.ACCENT if on else ps.MUTED, font=(family, 8, "bold"))
 
     # -- helpers ------------------------------------------------------------
     def log(self, text: str, tag: Optional[str] = None) -> None:
@@ -512,7 +525,7 @@ class PhantomApp:
     def upload(self) -> None:
         probs = self.problems()
         if probs or not self.jumpers_ok.get():
-            messagebox.showwarning("Cannot upload", "\n".join(probs) or "Confirm the jumper settings first.",
+            messagebox.showwarning("Cannot upload", "\n".join(probs) or "Confirm the microstep mode pins first.",
                                    parent=self.root)
             return
         traj, cycles, trigger = self.traj, self._cycles(), self.trigger
@@ -558,7 +571,7 @@ class PhantomApp:
 
     def arm(self) -> None:
         if not self.jumpers_ok.get():
-            messagebox.showwarning("Jumpers", "Confirm the jumper settings first.", parent=self.root)
+            messagebox.showwarning("Mode pins", "Confirm the microstep mode pins first.", parent=self.root)
             return
         trigger, cycles = self.trigger, self._cycles()
         def done(_):

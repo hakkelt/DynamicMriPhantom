@@ -100,7 +100,7 @@ def jumper_instructions(driver: str, microstep: int) -> str:
     pins = ", ".join(f"{p}={'HIGH' if v else 'LOW'}" for p, v in zip(info["pins"], levels))
     return (f"Set {'/'.join(info['pins'])} on the {driver} to: {pins}  "
             f"for 1/{microstep} microstepping "
-            f"(HIGH = jumper fitted on a CNC-shield style board, LOW = open).")
+            f"(HIGH = switch ON or jumper fitted, LOW = OFF or open).")
 
 
 # ----------------------------------------------------------------------------

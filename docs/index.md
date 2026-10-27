@@ -29,7 +29,7 @@ flowchart LR
   MRI["MRI scanner"] -->|"TTL: sequence start = t 0"| FW
   BTN["Button<br/>(debug: replaces the MRI)"] -.-> FW
   FW -->|"STEP / DIR"| DRV["DRV8825 / A4988"] --> MOT["Stepper"] --> PHA["Phantom"]
-  JMP["Microstep jumpers"] -.-> DRV
+  JMP["Microstep mode pins<br/>(DIP switch / jumpers)"] -.-> DRV
 ```
 
 | Part | Role | Page |
@@ -48,7 +48,7 @@ sequenceDiagram
   participant C as Controller
   participant MRI as MRI scanner
   Op->>PC: open / design trajectory
-  PC->>Op: set microstep jumpers (shown) and confirm
+  PC->>Op: set microstep mode pins (shown) and confirm
   PC->>C: upload segments (CRC checked on the device)
   PC->>C: ARM ttl ‹cycles›
   C-->>PC: OK ARM ttl  (armed, motor still)
@@ -60,7 +60,7 @@ sequenceDiagram
   PC->>Op: export ground truth CSV
 ```
 
-Before a scan, check that the jumpers are confirmed, the trigger is **MRI TTL**
+Before a scan, check that the mode pins are confirmed, the trigger is **MRI TTL**
 and the cycle count is set (0 = until Finish/STOP). After it, check that
 `EV DONE` reports `overruns=0`.
 
@@ -83,6 +83,6 @@ connect the GUI to `socket://127.0.0.1:5555`.
 | ESP32-S3 Dev Module (USB CDC on boot) | 5 | 6 | 8 | 9 | 4096 |
 
 200 steps/rev stepper with a DRV8825 or A4988 driver. The microstep is set
-with jumpers. The button connects to GND. The ESP32 TTL input is 3.3 V, so a
+with the driver's mode pins (DIP switch or jumpers). The button connects to GND. The ESP32 TTL input is 3.3 V, so a
 5 V trigger must be level-shifted. The ESP32 path passes all tests in a host
 simulation but is **not yet tested on hardware**.

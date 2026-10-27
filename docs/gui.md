@@ -18,7 +18,7 @@ the ground truth. Trajectories come from the [designer](designer.md) or from a
 | 3 | **Open… / Save…** a `.phtraj`, **Designer…**, **Export ground truth…** (CSV). |
 | 4 | **Summary**: shape, periods, cycle length, microstep and tick, segments and checksum, peak speed, max errors, streaming margin, and the warnings. |
 | 5 | **Compatibility** with the connected device: protocol, tick rate, memory (or a safe streaming margin), step rate, event spacing. Upload is blocked if a check fails. |
-| 6 | **Microstep jumpers**: the mode-pin levels for the compiled microstep on the chosen driver (DRV8825: M0–M2, A4988: MS1–MS3). Upload and Arm stay disabled until you tick *Jumpers are set as shown*. Changing the driver or the trajectory clears the tick. |
+| 6 | **Microstep mode pins**: the levels of the driver's mode pins for the compiled microstep, drawn as a DIP switch (knob up = ON = HIGH). It reads the same for jumpers (fitted = HIGH) and adapts to the driver (DRV8825: M0–M2, A4988: MS1–MS3). Upload and Arm stay disabled until you tick *Mode pins are set as shown*. Changing the driver or the trajectory clears the tick. |
 | 7 | **Trigger** and **Cycles** (0 = until Finish/STOP). The debug triggers show a warning that the motion is not synchronized. |
 | 8 | **Upload** (*Fill stream buffer* for streamed trajectories), **Arm / Start**, **Finish cycle** (stops at the end of the current cycle, back at 0) and **STOP** (immediate). |
 | 9 | **Progress**: upload progress, or the stream buffer level while playing. **Status** queries the cycle, position and overruns. |
