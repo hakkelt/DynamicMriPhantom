@@ -170,3 +170,30 @@ UCSR0B.
 **Still to validate on hardware:** STEP/DIR with a logic analyser against the
 plan, the driver current limit (lost steps are mechanical), and the ESP32
 trigger latency.
+
+## Possible improvement: hardware step edges (ATmega)
+
+*Not implemented: the existing PCB has STEP on D3.*
+
+Today the ISR raises STEP in software, so each rising edge carries the
+interrupt entry latency, and while streaming the serial receive interrupt can
+delay it by a few µs. Timer1 can instead drive its own pin **D9 (OC1A)** on
+the compare match, making every rising edge tick-exact:
+
+- **Long waits** stay chunked as now (`next_chunk`, `g_rem`). Intermediate
+  chunks and non-step events use `COM1A = 00` (pin untouched). The ISR that
+  schedules the *last* chunk of a step sets `COM1A = 11`, so the hardware sets
+  D9 on that match.
+- **Falling edge** stays in software: the ISR for that match sets `COM1A = 10`,
+  strobes `FOC1A` (forces D9 low) once the minimum pulse width has passed, then
+  returns to `COM1A = 00`. Drivers latch on the rising edge, so the fall only
+  needs the minimum width.
+- **Missed deadline** (existing overrun check): force the pulse with `FOC1A`
+  and count the overrun as now. `next_chunk` already keeps the last piece long
+  enough to program in time.
+- `hw_start_at()` sets the mode for the first event; `hw_stop()` sets
+  `COM1A = 00` with PORTB1 low. DIR stays a normal pin written in the ISR.
+
+Needs a board revision (STEP → D9, same pin on the 328PB). The emulator tests
+could then demand cycle-exact steps while streaming, provided avr8js models
+the compare-output modes and `FOC1A` (to check). The ESP32 is not affected.
