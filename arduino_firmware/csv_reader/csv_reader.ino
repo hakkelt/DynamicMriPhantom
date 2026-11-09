@@ -54,6 +54,7 @@ uint16_t receivedPoints = 0;
 
 unsigned long cycleStartTime = 0;
 bool buttonWasPressed = false;
+bool mriSignalSent = false;
 
 
 // ============================================================
@@ -135,8 +136,12 @@ void loop()
         buttonWasPressed = true;
     }
 
+    if (trajectoryLoaded && digitalRead(MRI_PIN) == HIGH){
+        mriSignalSent = true;
+    }
 
-    if (trajectoryLoaded && buttonWasPressed)
+
+    if (trajectoryLoaded && (buttonWasPressed || mriSignalSent))
     {
         runTrajectory();
     }

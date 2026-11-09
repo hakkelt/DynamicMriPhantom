@@ -7,7 +7,7 @@
 #define STEP_PIN 6
 #define DIR_PIN  5
 #define BTN_PIN 8
-#define MRI_PIN 7
+#define MRI_PIN 9
 
 // Initialize the stepper (DRIVER mode uses Step and Direction pins)
 AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
@@ -35,8 +35,11 @@ void setup() {
   // Set stepper limits (Adjust based on your motor's torque/speed)
   stepper.setMaxSpeed(6000);
   stepper.setAcceleration(6000);
+  
+  // TRY THIS _..--°°--..__..--°°--..__..--°°--..__..--°°--..__..--°°--.._  
+  //stepper.setMinPulseWidth(10);
 
-  //pinMode(MRI_PIN, INPUT); //INPUT for START (1/2)
+  pinMode(MRI_PIN, INPUT); //INPUT for START (1/2)
 }
 
 void loop() {
@@ -100,12 +103,12 @@ void loop() {
   }
 
 
-  //if(currentState == ARMED) {
-  //  if (digitalRead(MRI_PIN) == HIGH) { //HIGH for START INPUT (2/2)
-  //    currentState = MOVING;
-  //    phaseStartTime = millis();
-  //  }
-  //}
+  if(currentState == ARMED) {
+    if (digitalRead(MRI_PIN) == HIGH) { //HIGH for START INPUT (2/2)
+      currentState = MOVING;
+      phaseStartTime = millis();
+    }
+  }
 
   if (currentState == MOVING || currentState == DWELLING) {
     unsigned long elapsed = millis() - phaseStartTime;

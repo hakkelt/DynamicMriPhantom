@@ -237,9 +237,9 @@ def main():
 
     # Generate trajectory
     trajectory, period_ms = generate_trajectory(
-        move_time= 1000,
-        dwell_time= 500,
-        amplitude= 180,
+        move_time= 800,
+        dwell_time= 200,
+        amplitude= 90,
         gamma= 1,
     )
 

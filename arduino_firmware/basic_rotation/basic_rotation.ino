@@ -3,9 +3,9 @@
 // Define pin connections & motor's steps per revolution
 const int dirPin = 5;
 const int stepPin = 6;
-const int buttonPin = 8; //5
-const int mriPin = 9; //7
-const int stepsPerRevolution = 200; //200
+const int buttonPin = 8;
+const int mriPin = 9;
+const int stepsPerRevolution = 400; //200
 const int waitTime = 2000;
 
 int counter = 0;
@@ -32,7 +32,7 @@ void loop() {
   //rotating = true;
 
   // Keep rotating if enabled
-  if (rotating && counter < 10) {
+  if (rotating && counter < 100) {
     // Set motor direction clockwise
     digitalWrite(dirPin, HIGH);
 

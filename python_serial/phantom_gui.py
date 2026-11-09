@@ -9,11 +9,11 @@ DEFAULT_PORT = "/dev/ttyACM0"
 def calculate_max_speed(amplitude, move_ms, gamma, microstep):
 
     move_s = move_ms/1000
-    N_points = 100
+    N_points = 250
 
     times = np.linspace(0,move_s, N_points+1)
     dt = move_s/N_points
-    Positions = (1.0 - np.cos(2*np.pi * (times/move_s)**gamma)) * amplitude * microstep / 1.8
+    Positions = (1.0 - np.cos(2*np.pi * (times/move_s)**gamma)) * amplitude * microstep / 3.6
     max_speed = np.max(np.abs(np.gradient(Positions))) / dt
     return max_speed
 

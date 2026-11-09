@@ -5,3 +5,4 @@
 .vscode/ipch
 python_serial/trajectory.csv
 .venv
+python_serial/testing.py
