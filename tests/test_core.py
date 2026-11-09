@@ -278,6 +278,24 @@ def test_number_of_periods_limited_only_by_the_device():
         pc.compile_design(long, pc.Limits(), board_caps("esp32s3"))
 
 
+def test_planner_fits_each_tick_once(monkeypatch):
+    """When the program does not fit in memory, the in-memory trial at a tick is
+    not redone for streaming: every tick is fitted once."""
+    caps = board_caps("atmega328pb")
+    calls = []
+    fit = pc.fit_segments
+    monkeypatch.setattr(pc, "fit_segments", lambda tau, *a, **k: calls.append(tau[1]) or fit(tau, *a, **k))
+    big = pc.compile_design(IRREGULAR, pc.Limits(), caps)
+    assert big.metrics["streamed"] and big.microstep == 32
+    fine = [t for t in caps["tick_hz"] if 1e6 / t <= pc.Limits().tolerance_us]
+    assert len(calls) == len(set(calls)) == len(fine)
+    # a program that fits is the same whether streaming is allowed or not
+    small = pc.Design(amplitude_deg=30)
+    a = pc.compile_design(small, pc.Limits(), caps)
+    b = pc.compile_design(small, pc.Limits(allow_streaming=False), caps)
+    assert a.segments == b.segments and a.tick_hz == b.tick_hz and not a.metrics["streamed"]
+
+
 def test_stream_slack_model():
     caps = board_caps("atmega328pb")
     big = pc.compile_design(IRREGULAR, pc.Limits(), caps)

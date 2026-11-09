@@ -1087,7 +1087,11 @@ def plan(design: Design, limits: Limits, caps: dict, periods: Optional[list[Peri
             continue
         # Prefer a program that fits in the device (finest tick first). Stream
         # only if none does, then with the tick that leaves the largest margin.
-        modes = [False] + ([True] if limits.allow_streaming and caps.get("stream") else [])
+        can_stream = limits.allow_streaming and caps.get("stream")
+        modes = [False] + ([True] if can_stream else [])
+        # A fit is the same with or without the memory limit, so when streaming
+        # is possible fit each tick once in full and reuse it for streaming.
+        fits = {}
         for streamed in modes:
             best = None
             for tick in sorted(caps["tick_hz"], reverse=True):
@@ -1105,7 +1109,19 @@ def plan(design: Design, limits: Limits, caps: dict, periods: Optional[list[Peri
                 tp = timing_params(caps, tick, limits.tolerance_us)
                 tau = t * tick
                 try:
-                    segs = fit_segments(tau, d, total_ticks, tp, None if streamed else caps["max_segments"])
+                    if not can_stream:
+                        segs = fit_segments(tau, d, total_ticks, tp, caps["max_segments"])
+                    else:
+                        if tick not in fits:
+                            try:
+                                fits[tick] = fit_segments(tau, d, total_ticks, tp)
+                            except FitError as exc:
+                                fits[tick] = exc
+                        if isinstance(fits[tick], FitError):
+                            raise fits[tick]
+                        segs = fits[tick]
+                        if not streamed and len(segs) > caps["max_segments"]:
+                            raise FitError(f"{len(segs)} segments needed, device holds {caps['max_segments']}")
                     if streamed:
                         why = stream_problem(segs, tick, total_ticks, caps, limits)
                         if why:

@@ -96,6 +96,8 @@ At a given microstep, a program that fits in memory always wins. If none
 fits, the planner checks whether it can be streamed. It models the serial
 link and the deadline of every segment, and requires the PC to stay at least
 **300 ms** ahead (`min_stream_slack_ms`) using at most 80 % of the link. Among
-the ticks that pass, it picks the one with the largest margin. Set
+the ticks that pass, it picks the one with the largest margin. Each tick is
+fitted only once: the in-memory trial is the same fit without the memory
+limit, so it is reused for streaming. Set
 `allow_streaming=False` to fall back to a smaller microstep instead. See
 [Firmware → Streaming](firmware.md#streaming).
