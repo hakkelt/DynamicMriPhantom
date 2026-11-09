@@ -180,8 +180,8 @@ def generate_periods(design: Design) -> list[Period]:
     if design.shape not in SHAPES:
         raise ValueError(f"unknown shape {design.shape!r}")
     k = int(design.n_periods)
-    if not 1 <= k <= 5:
-        raise ValueError("n_periods must be between 1 and 5")
+    if k < 1:
+        raise ValueError("n_periods must be at least 1")
     rng = np.random.default_rng(design.seed)
     periods = []
     for _ in range(k):
@@ -1068,6 +1068,13 @@ def plan(design: Design, limits: Limits, caps: dict, periods: Optional[list[Peri
     max_rate = min(caps["max_step_rate_hz"], DRIVERS[limits.driver]["max_step_rate_hz"])
     attempts = []
     total_s = sequence_length_s(periods)
+    # The number of periods is limited only by what the device can play: one
+    # cycle must fit in 32-bit ticks at some tick fine enough for the tolerance.
+    ticks = [tick for tick in caps["tick_hz"] if 1e6 / tick <= limits.tolerance_us]
+    if ticks and total_s * min(ticks) >= 2 ** 32:
+        return PlanResult(None, attempts, f"the sequence lasts {total_s / 60:.0f} min, longer than the "
+                          f"{2 ** 32 / min(ticks) / 60:.0f} min one cycle can last at "
+                          f"{limits.tolerance_us:g} us tolerance")
     for ms in allowed:
         t, d = step_times(design.shape, periods, ms)
         if len(t) == 0:
@@ -1140,7 +1147,7 @@ def compile_design(design: Design, limits: Limits, caps: dict, periods=None) -> 
     res = plan(design, limits, caps, periods)
     if res.trajectory is None:
         detail = "; ".join(f"1/{a['microstep']} @ {a['tick_hz']} Hz: {a['result']}" for a in res.attempts)
-        raise FitError(f"{res.error}. Tried: {detail}")
+        raise FitError(f"{res.error}. Tried: {detail}" if detail else res.error)
     return res.trajectory
 
 

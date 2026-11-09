@@ -25,7 +25,7 @@ Each period rises from 0 to the amplitude and returns to 0. The peak is at
 | Skewed Gaussian | Split normal; each end is 3σ from the peak | Small, non-zero end speed |
 | Skewed triangle | Constant speed on each ramp | Speed jumps at the corners (the designer warns) |
 
-A **delay** (dwell at 0) follows each period. **Irregularity** draws K = 1–5
+A **delay** (dwell at 0) follows each period. **Irregularity** draws K
 distinct periods from a seed, with a % spread of length, amplitude and delay
 and an absolute skew jitter. The K periods repeat every cycle. The generated
 per-period table is stored in the file, so a trajectory never depends on the

@@ -254,6 +254,30 @@ def test_planner_streams_only_what_does_not_fit():
     assert pc.compatibility_problems(big, {**caps, "stream": False})
 
 
+MANY = pc.Design(shape="sinusoid", amplitude_deg=10, length_ms=300, n_periods=40, length_spread_pct=10,
+                 amplitude_spread_pct=10, skew_jitter=0.1, delay_ms=50, delay_spread_pct=10)
+
+
+def test_number_of_periods_limited_only_by_the_device():
+    with pytest.raises(ValueError):
+        pc.generate_periods(pc.Design(n_periods=0))
+    # 40 periods: streamed on the ATmega, in memory on the ESP32, every period kept
+    for board, streamed in (("atmega328pb", True), ("esp32s3", False)):
+        traj = pc.compile_design(MANY, pc.Limits(), board_caps(board))
+        assert len(traj.periods) == 40 and traj.metrics["streamed"] == streamed
+        assert pc.compatibility_problems(traj, board_caps(board)) == []
+        gt_t, _ = pc.ground_truth(traj)
+        assert len(gt_t) == len(traj.step_targets()[0])
+    # without streaming the ATmega cannot hold them
+    assert pc.plan(MANY, pc.Limits(allow_streaming=False), board_caps("atmega328pb")).trajectory is None
+    # a cycle longer than 32-bit ticks allow at the tolerance is refused up front
+    long = pc.Design(amplitude_deg=10, length_ms=4000, n_periods=5000)
+    res = pc.plan(long, pc.Limits(), board_caps("esp32s3"))
+    assert res.trajectory is None and res.attempts == [] and "one cycle can last" in res.error
+    with pytest.raises(pc.FitError, match="one cycle can last"):
+        pc.compile_design(long, pc.Limits(), board_caps("esp32s3"))
+
+
 def test_stream_slack_model():
     caps = board_caps("atmega328pb")
     big = pc.compile_design(IRREGULAR, pc.Limits(), caps)

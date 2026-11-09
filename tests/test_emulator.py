@@ -296,6 +296,22 @@ def test_stream_plays_exactly(rig_rt):
     assert dev.status()["state"] == "idle"  # a streamed program is used up
 
 
+def test_stream_many_periods(rig_rt):
+    """No fixed cap on distinct periods: 30 of them, streamed, play exactly."""
+    emu, dev = rig_rt
+    design = pc.Design(shape="sinusoid", amplitude_deg=5, length_ms=100, n_periods=30, length_spread_pct=10,
+                       amplitude_spread_pct=10, skew_jitter=0.1, delay_ms=20, delay_spread_pct=10)
+    traj = pc.compile_design(design, pc.Limits(), {**dev.caps, "max_segments": 72})
+    assert len(traj.periods) == 30 and traj.metrics["streamed"] and len(traj.segments) > 4 * 72
+    session = dev.stream(traj, cycles=1, trigger="ttl", slots=16)
+    dev.arm()
+    t0 = emu.ttl()
+    done = dev.wait_event("EV DONE", timeout=60)
+    assert "overruns=0" in done and "pos=0" in done
+    assert session.sent == len(traj.segments) and session.closed
+    check_waveform(emu, emu.trace(), traj, 1, t0, streamed=True)
+
+
 def test_stream_finish_stops_at_cycle_end(rig_rt):
     emu, dev = rig_rt
     traj = pc.compile_design(stream_design(), pc.Limits(), {**dev.caps, "max_segments": 72})

@@ -74,7 +74,7 @@ class DesignerWindow(tk.Toplevel):
         self._entry(shape, "delay_ms", "Delay between periods (ms)", d.delay_ms, 4)
 
         irr = ps.card(left, "Irregularity (K distinct periods, repeated)", fill=tk.X, pady=(6, 0))
-        self._spin(irr, "n_periods", "Distinct periods K", d.n_periods, 1, 5, 0)
+        self._spin(irr, "n_periods", "Distinct periods K", d.n_periods, 1, 9999, 0)
         self._entry(irr, "length_spread_pct", "Length spread (%)", d.length_spread_pct, 1)
         self._entry(irr, "amplitude_spread_pct", "Amplitude spread (%)", d.amplitude_spread_pct, 2)
         self._entry(irr, "delay_spread_pct", "Delay spread (%)", d.delay_spread_pct, 3)

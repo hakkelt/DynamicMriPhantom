@@ -14,7 +14,7 @@ one device. It shows exactly what the firmware will play.
 | Card | Parameters |
 |---|---|
 | **Shape** | Shape (sinusoid, Gaussian, triangle), amplitude (deg), period length (ms), skewness (−0.95 … 0.95), delay between periods (ms) |
-| **Irregularity** | Distinct periods K (1–5), spread of length, amplitude and delay (%), skew jitter, seed (**New seed** draws another) |
+| **Irregularity** | Distinct periods K (no fixed cap: a cycle may last up to ~70 min on the ESP32, ~4.7 h on the ATmega), spread of length, amplitude and delay (%), skew jitter, seed (**New seed** draws another) |
 | **Driver and limits** | Driver (DRV8825, A4988), allowed microsteps, max speed, max acceleration, start/stop speed, timing tolerance (default 10 µs), target device |
 
 The target is the connected device (its real capabilities) or the default
