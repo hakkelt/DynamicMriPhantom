@@ -140,6 +140,23 @@ def test_ttl_triggered_playback(rig):
     print(f"trigger latency {off.mean():.2f} us, jitter {off.max() - off.min():.3f} us")
 
 
+def test_csv_trajectory_plays_exactly(rig):
+    """An ideal trajectory from a CSV: two unequal breaths, TTL-triggered."""
+    emu, dev = rig
+    t = np.linspace(0, 1.2, 61)
+    x = 6 * np.sin(np.pi * t / 0.6) ** 2 * np.where(t < 0.6, 1.0, 0.6)
+    x[-1] = 0
+    design = pc.Design(shape=pc.CSV_SHAPE, samples=np.column_stack([t, x]).tolist(), source="two.csv")
+    traj = pc.compile_design(design, pc.Limits(), dev.caps)
+    assert not traj.metrics["streamed"]
+    dev.upload(traj, cycles=1, trigger="ttl")
+    dev.arm()
+    t0 = emu.ttl()
+    done = dev.wait_event("EV DONE", timeout=60)
+    assert "overruns=0" in done and "pos=0" in done
+    check_waveform(emu, emu.trace(), traj, 1, t0)
+
+
 @pytest.mark.parametrize("shape,board_tick", [("triangle", None), ("gaussian", 2_000_000)])
 def test_immediate_start_shapes(rig, shape, board_tick):
     emu, dev = rig

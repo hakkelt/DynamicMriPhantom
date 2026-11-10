@@ -329,3 +329,121 @@ def test_stream_line_crc():
     c, i, a, a2, f, crc = map(int, line.split()[1:])
     assert f == pc.FLAG_DIR | pc.FLAG_CYCLE
     assert crc == pc.crc16_ccitt(pc.pack_segment((c, i, a, a2, f)))
+
+
+# -- ideal trajectory from a CSV ------------------------------------------------
+
+def breathing(n_breaths=3, rate_hz=50, period_s=4.0):
+    """An irregular breathing-like motion, sampled, ending where it starts."""
+    t = np.arange(0, n_breaths * period_s + 1e-9, 1 / rate_hz)
+    x = 8 * np.sin(np.pi * t / period_s) ** 2 * (1 + 0.2 * np.sin(t)) + 3.0  # starts at 3 deg
+    x[-1] = x[0]
+    return t, x
+
+
+def write_csv(path, text):
+    path.write_text(text)
+    return str(path)
+
+
+def test_read_trajectory_csv_formats(tmp_path):
+    want = np.array([[0, 0], [0.5, 2], [1.0, 0]])
+    for name, text in [
+        ("s.csv", "time_s,position_deg\n0,0\n0.5,2\n1,0\n"),
+        ("ms.csv", "# my phantom\ntime_ms;position_deg\n0;0\n500;2\n1000;0\n"),
+        ("bare.txt", "0 0\n0.5\t2\n1.0  0\n"),
+        ("export.csv", "# phantom ground truth\n# time_s,position_deg\n0.000,0\n0.5,2\n1,0\n"),
+        ("time (ms).csv", "Time (ms),Angle\n0,0\n500,2\n1000,0\n"),
+    ]:
+        assert np.allclose(pc.read_trajectory_csv(write_csv(tmp_path / name, text)), want), name
+    for text, msg in [("t,x\n", "no samples"), ("0,0\n0.5,2\nx,y\n", "not a number"), ("0\n", "expected")]:
+        with pytest.raises(ValueError, match=msg):
+            pc.read_trajectory_csv(write_csv(tmp_path / "bad.csv", text))
+
+
+@pytest.mark.parametrize("t,x,msg", [
+    ([0, 1, 2], [0, 1, 0.5], "must end where it starts"),
+    ([0, 1, 1, 2], [0, 1, 1, 0], "time must increase"),
+    ([0, 1], [0, 0], "at least 3"),
+])
+def test_csv_trajectory_rejected(t, x, msg):
+    with pytest.raises(ValueError, match=msg):
+        pc.SampledPath(t, x)
+
+
+def test_sampled_path_interpolates_without_overshoot():
+    t, x = breathing()
+    path = pc.SampledPath(t + 2.0, x)  # times and positions are relative to the first sample
+    assert path.duration_s == pytest.approx(t[-1])
+    assert np.allclose(path.position(t), x - x[0], atol=1e-12)
+    # monotone between samples: never outside the two neighbours
+    tt = np.linspace(0, t[-1], 50_001)[:-1]
+    k = np.searchsorted(t, tt, side="right") - 1
+    y = path.position(tt)
+    lo, hi = np.minimum(x[k], x[k + 1]) - x[0], np.maximum(x[k], x[k + 1]) - x[0]
+    assert np.all((y >= lo - 1e-9) & (y <= hi + 1e-9))
+    # the speed matches the slope of the position, and loops smoothly
+    v = path.velocity(tt)
+    assert np.allclose(np.gradient(y, tt)[1:-1], v[1:-1], atol=0.05 * np.abs(v).max())
+    assert path.velocity(0.0) == pytest.approx(path.velocity(t[-1] - 1e-9), abs=1e-3)
+    assert path.position(t[-1] + 0.25) == pytest.approx(path.position(0.25))
+
+
+@pytest.mark.parametrize("ms", [4, 32])
+def test_csv_step_times(ms):
+    t, x = breathing()
+    path = pc.SampledPath(t, x)
+    st, d = path.step_times(ms)
+    assert np.all(np.diff(st) > 0) and d.sum() == 0  # ordered, zero net steps per cycle
+    # the turning points (whole microsteps) are reached exactly, between them a
+    # step is where the curve crosses a half step: the error stays within
+    # 1/2 microstep plus the rounding of the turning points
+    tt = np.linspace(0, t[-1], 200_001)[:-1]
+    real = np.concatenate([[0], np.cumsum(d)])[np.searchsorted(st, tt, side="right")]
+    err = np.abs(real - pc.degrees_to_steps(path.position(tt), ms))
+    assert err.max() <= 0.5 + pc.degrees_to_steps(path.quantization_deg(ms), ms) + 1e-6
+    # one direction change per turning point: no chatter
+    turns = np.count_nonzero(np.diff(d))
+    assert turns == 2 * 3 - 1
+
+
+def test_csv_wiggles_below_a_microstep_make_no_steps():
+    dps = pc.deg_per_step(16)
+    t = np.linspace(0, 1, 101)
+    x = 0.2 * dps * np.sin(2 * np.pi * 7 * t)
+    x[-1] = 0
+    st, _ = pc.SampledPath(t, x).step_times(16)
+    assert len(st) == 0
+
+
+@pytest.mark.parametrize("board", ["atmega328pb", "esp32s3"])
+def test_compile_csv_trajectory(tmp_path, board):
+    t, x = breathing()
+    path = tmp_path / "breath.csv"
+    np.savetxt(path, np.column_stack([t * 1000, x]), delimiter=",", header="time_ms,position_deg",
+               comments="")
+    design = pc.design_from_csv(path)
+    assert design.shape == pc.CSV_SHAPE and design.source == "breath.csv"
+    traj = pc.compile_design(design, pc.Limits(), board_caps(board))
+    m = traj.metrics
+    assert m["cycle_s"] == pytest.approx(t[-1])
+    assert m["max_position_error_deg"] <= pc.deg_per_step(traj.microstep)
+    assert m["max_timing_error_us"] <= 10.0
+    assert m["peak_speed_dps"] == pytest.approx(np.abs(np.gradient(x, t)).max(), rel=0.05)
+    assert any("turning points rounded" in w for w in traj.warnings)
+    # the curves and the ground truth follow the samples
+    c = pc.trajectory_curves(traj)
+    assert np.abs(c["error_deg"]).max() <= pc.deg_per_step(traj.microstep)
+    # saved with its samples (format version 2) and loaded back identically
+    d = traj.to_dict()
+    assert d["version"] == 2 and len(d["design"]["samples"]) == len(t)
+    back = pc.CompiledTrajectory.from_dict(d)
+    assert back.checksum == traj.checksum
+    assert np.array_equal(back.step_targets()[0], traj.step_targets()[0])
+
+
+def test_shape_files_stay_version_1():
+    traj = pc.compile_design(pc.Design(amplitude_deg=5, length_ms=500), pc.Limits(), board_caps("esp32s3"))
+    d = traj.to_dict()
+    assert d["version"] == 1 and "samples" not in d["design"]
+    assert pc.CompiledTrajectory.from_dict(d).design == traj.design

@@ -37,10 +37,14 @@ def _plan_with_curves(design, limits, caps):
     return res, (pc.trajectory_curves(res.trajectory) if res.trajectory else None)
 
 
+# Parameters of the shapes, not used by a CSV trajectory.
+SHAPE_PARAMS = ("amplitude_deg", "length_ms", "skew", "delay_ms", "n_periods", "length_spread_pct",
+                "amplitude_spread_pct", "delay_spread_pct", "skew_jitter", "seed", "new_seed")
+
 # Tooltips of the designer's fields, by parameter.
 TIPS = {
     "shape": "Shape of one period: sinusoid (zero speed at the ends and the peak), Gaussian, "
-             "or triangle (constant speed, sharp corners).",
+             "or triangle (constant speed, sharp corners); csv once a CSV trajectory is loaded.",
     "amplitude_deg": "Peak rotation of a period, in degrees from the rest position.",
     "length_ms": "Duration of one period, rest to peak and back, without the delay.",
     "skew": "Where the peak sits: 0 = in the middle, positive = later (slow rise, fast fall), "
@@ -82,6 +86,9 @@ class DesignerWindow(tk.Toplevel):
         self._busy = False
         self._vars: dict[str, tk.Variable] = {}
         self._ms_vars: dict[int, tk.BooleanVar] = {}
+        self._fields: dict[str, ttk.Widget] = {}
+        self._combo_widgets: dict[str, ttk.Combobox] = {}
+        self._csv: Optional[pc.Design] = None  # the loaded CSV trajectory (shape "csv")
         self._build()
         if initial is not None:
             self.set_design(initial.design, initial.limits)
@@ -99,6 +106,14 @@ class DesignerWindow(tk.Toplevel):
         d, lim = pc.Design(), pc.Limits()
         shape = ps.card(left, "Shape", fill=tk.X)
         self._combo(shape, "shape", "Shape", pc.SHAPES, d.shape, 0)
+        self.csv_btn = ttk.Button(shape, text="Load CSV…", command=self.load_csv)
+        self.csv_btn.grid(row=0, column=2, sticky="w", padx=2)
+        ps.tip("Design from an ideal trajectory instead of a shape: a CSV of time and position (deg) "
+               "rows covering one cycle, which repeats. The time is in seconds, or in ms if the header "
+               "says so (time_ms). It must end at its starting position; position 0 is the first row. "
+               "The shape and irregularity parameters are then not used.", self.csv_btn)
+        self.csv_label = ttk.Label(shape, text="", style="Muted.TLabel", wraplength=330, justify=tk.LEFT)
+        self.csv_label.grid(row=5, column=0, columnspan=3, sticky="w")
         self._entry(shape, "amplitude_deg", "Amplitude (deg)", d.amplitude_deg, 1)
         self._entry(shape, "length_ms", "Period length (ms)", d.length_ms, 2)
         self._entry(shape, "skew", "Skewness (-0.95..0.95)", d.skew, 3)
@@ -113,6 +128,8 @@ class DesignerWindow(tk.Toplevel):
         self._entry(irr, "seed", "Seed", d.seed, 5)
         seed_btn = ttk.Button(irr, text="New seed", command=self._new_seed)
         seed_btn.grid(row=5, column=2, padx=2)
+        self._fields["new_seed"] = seed_btn
+        self._vars["shape"].trace_add("write", lambda *_: self._shape_changed())
         ps.tip("Draw a random seed: another set of K periods with the same spreads.", seed_btn)
 
         drv = ps.card(left, "Driver and limits", fill=tk.X, pady=(6, 0))
@@ -208,6 +225,7 @@ class DesignerWindow(tk.Toplevel):
         v = tk.StringVar(value=str(value))
         self._vars[key] = v
         w = ttk.Entry(parent, textvariable=v, width=12)
+        self._fields[key] = w
         w.grid(row=row, column=1, sticky="w")
         ps.tip(TIPS[key], lbl, w)
 
@@ -216,6 +234,7 @@ class DesignerWindow(tk.Toplevel):
         v = tk.StringVar(value=str(value))
         self._vars[key] = v
         w = ttk.Spinbox(parent, from_=lo, to=hi, textvariable=v, width=10)
+        self._fields[key] = w
         w.grid(row=row, column=1, sticky="w")
         ps.tip(TIPS[key], lbl, w)
 
@@ -225,6 +244,7 @@ class DesignerWindow(tk.Toplevel):
         self._vars[key] = v
         w = ttk.Combobox(parent, textvariable=v, values=list(values), state="readonly",
                          width=26 if key == "target" else 12)
+        self._combo_widgets[key] = w
         w.grid(row=row, column=1, columnspan=2, sticky="w")
         ps.tip(TIPS[key], lbl, w)
 
@@ -238,6 +258,41 @@ class DesignerWindow(tk.Toplevel):
             elif not any(self._ms_vars[x].get() for x in ok):
                 self._ms_vars[m].set(True)
 
+    def load_csv(self, path: Optional[str] = None) -> None:
+        """Use an ideal trajectory from a CSV file as the design."""
+        if path is None:
+            path = filedialog.askopenfilename(parent=self, title="Ideal trajectory",
+                                              filetypes=[("CSV", "*.csv *.txt"), ("All files", "*")])
+            if not path:
+                return
+        try:
+            design = pc.design_from_csv(path)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Cannot use this CSV", str(exc), parent=self)
+            return
+        self._use_csv(design)
+
+    def _use_csv(self, design: pc.Design) -> None:
+        self._csv = design
+        box = self._combo_widgets["shape"]
+        box.configure(values=list(pc.SHAPES) + [pc.CSV_SHAPE])
+        self._vars["shape"].set(pc.CSV_SHAPE)
+        self._shape_changed()
+
+    def _shape_changed(self) -> None:
+        csv = self._vars["shape"].get() == pc.CSV_SHAPE
+        for key, w in self._fields.items():
+            if key in SHAPE_PARAMS:
+                w.state(["disabled"] if csv else ["!disabled"])
+        if csv and self._csv is not None:
+            path = pc.shape_of(self._csv)
+            self.csv_label.configure(
+                text=f"From {self._csv.source}: {len(path.t)} samples, cycle {path.duration_s:.3f} s, "
+                     f"position {path.x.min():.2f} to {path.x.max():.2f} deg")
+        else:
+            self.csv_label.configure(text="")
+        self._update_periods()
+
     def _new_seed(self) -> None:
         import random
         self._vars["seed"].set(str(random.randint(1, 999_999)))
@@ -250,6 +305,10 @@ class DesignerWindow(tk.Toplevel):
             raise ValueError(f"{key}: '{text}' is not a number") from None
 
     def design(self) -> pc.Design:
+        if self._vars["shape"].get() == pc.CSV_SHAPE:
+            if self._csv is None:
+                raise ValueError("load a CSV trajectory first")
+            return self._csv
         return pc.Design(
             shape=self._vars["shape"].get(),
             amplitude_deg=self._num("amplitude_deg"),
@@ -279,7 +338,12 @@ class DesignerWindow(tk.Toplevel):
 
     def set_design(self, design: pc.Design, limits: pc.Limits) -> None:
         for k, v in dataclasses.asdict(design).items():
-            self._vars[k].set(str(v))
+            if k in self._vars and k != "shape":
+                self._vars[k].set(str(v))
+        if design.shape == pc.CSV_SHAPE:
+            self._use_csv(design)
+        else:
+            self._vars["shape"].set(design.shape)
         for k in ("driver", "max_speed_dps", "max_accel_dps2", "start_stop_speed_dps", "tolerance_us"):
             self._vars[k].set(str(getattr(limits, k)))
         allowed = limits.allowed_microsteps or pc.driver_microsteps(limits.driver)

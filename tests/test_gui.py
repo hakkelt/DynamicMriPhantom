@@ -236,3 +236,50 @@ def test_every_control_has_a_tooltip(app):
     assert tip._win is not None and "end stop" in tip.text
     tip._hide()
     assert tip._win is None
+
+
+def test_designer_from_csv(app, tmp_path):
+    import numpy as np
+    t = np.linspace(0, 2.0, 101)
+    x = 5 + 7 * np.sin(np.pi * t / 1.0) ** 2 * np.where(t < 1.0, 1.0, 0.5)
+    x[-1] = x[0]
+    path = tmp_path / "breath.csv"
+    np.savetxt(path, np.column_stack([t * 1000, x]), delimiter=",", header="time_ms,position_deg", comments="")
+    app.open_designer()
+    pump(app.root, lambda: app.designer is not None)
+    dz = app.designer
+    dz._vars["target"].set("ESP32-S3 (default caps)")
+    dz.load_csv(str(path))
+    pump(app.root)
+    assert dz._vars["shape"].get() == pc.CSV_SHAPE
+    assert "breath.csv: 101 samples, cycle 2.000 s" in dz.csv_label.cget("text")
+    assert dz._fields["amplitude_deg"].instate(["disabled"]) and dz._fields["seed"].instate(["disabled"])
+    assert len(dz.table.get_children()) == 1  # the whole cycle is one period
+    res = dz.compile_sync()
+    assert res.trajectory is not None and res.trajectory.design.source == "breath.csv"
+    dz.send()
+    pump(app.root)
+    assert app.traj is res.trajectory
+    summary = app.summary.get("1.0", "end")
+    assert "Ideal trajectory from CSV" in summary and "breath.csv · 101 samples" in summary
+    # back to a shape: its fields come back, and a designer opened on the CSV trajectory shows it again
+    dz._vars["shape"].set("sinusoid")
+    pump(app.root)
+    assert not dz._fields["amplitude_deg"].instate(["disabled"])
+    assert dz.design().shape == "sinusoid"
+    dz.set_design(res.trajectory.design, res.trajectory.limits)
+    assert dz.design() is res.trajectory.design
+
+
+def test_designer_rejects_bad_csv(app, tmp_path, monkeypatch):
+    path = tmp_path / "open.csv"
+    path.write_text("0,0\n1,2\n2,1\n")
+    app.open_designer()
+    pump(app.root, lambda: app.designer is not None)
+    errors = []
+    import phantom_designer
+    monkeypatch.setattr(phantom_designer.messagebox,
+                        "showerror", lambda title, msg, **kw: errors.append(msg))
+    app.designer.load_csv(str(path))
+    assert errors and "must end where it starts" in errors[0]
+    assert app.designer._vars["shape"].get() == "sinusoid"

@@ -13,9 +13,12 @@ one device. It shows exactly what the firmware will play.
 
 | Card | Parameters |
 |---|---|
-| **Shape** | Shape (sinusoid, Gaussian, triangle), amplitude (deg), period length (ms), skewness (−0.95 … 0.95), delay between periods (ms) |
+| **Shape** | Shape (sinusoid, Gaussian, triangle), amplitude (deg), period length (ms), skewness (−0.95 … 0.95), delay between periods (ms); or **Load CSV…** an ideal trajectory (time, position), see [CSV](trajectory.md#ideal-trajectory-from-a-csv) |
 | **Irregularity** | Distinct periods K (no fixed cap: a cycle may last up to ~70 min on the ESP32, ~4.7 h on the ATmega), spread of length, amplitude and delay (%), skew jitter, seed (**New seed** draws another) |
 | **Driver and limits** | Driver (DRV8825, A4988), allowed microsteps, max speed, max acceleration, start/stop speed, timing tolerance (default 10 µs), target device |
+
+With a CSV loaded, the shape is `csv`, the shape and irregularity fields are
+greyed out, and the whole cycle is one period. Pick a shape again to go back.
 
 The target is the connected device (its real capabilities) or the default
 capabilities of the ATmega328PB or ESP32-S3, for working offline. Shapes and

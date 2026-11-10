@@ -405,9 +405,14 @@ class PhantomApp:
             m = t.metrics
             name = os.path.basename(self.traj_path) if self.traj_path else "from the designer"
             per = ", ".join(f"{p.length_ms:.0f} ms / {p.amplitude_deg:.1f}°" for p in t.periods)
-            parts = [(f"{t.design.shape.capitalize()} · {len(t.periods)} period(s)\n", "head")]
-            ps.kv(parts, "File", name)
-            ps.kv(parts, "Periods", f"{per}, skew {t.design.skew:+.2f}")
+            if t.design.shape == pc.CSV_SHAPE:
+                parts = [("Ideal trajectory from CSV\n", "head")]
+                ps.kv(parts, "File", name)
+                ps.kv(parts, "Source", f"{t.design.source} · {len(t.design.samples)} samples")
+            else:
+                parts = [(f"{t.design.shape.capitalize()} · {len(t.periods)} period(s)\n", "head")]
+                ps.kv(parts, "File", name)
+                ps.kv(parts, "Periods", f"{per}, skew {t.design.skew:+.2f}")
             ps.kv(parts, "Cycle", f"{t.cycle_s * 1000:.3f} ms · {m.get('steps_per_cycle', '?')} steps")
             ps.kv(parts, "Microstep", f"1/{t.microstep} · tick {t.tick_hz:,} Hz · {t.driver}")
             ps.kv(parts, "Segments", f"{len(t.segments)} ({m.get('memory_bytes', '?')} bytes) · "

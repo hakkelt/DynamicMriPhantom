@@ -36,7 +36,7 @@ import numpy as np
 
 FORMAT_NAME = "phantom-trajectory"
 PROTOCOL_VERSION = 1  # serial protocol of arduino_firmware/segment_player
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2  # 2: a design may hold CSV samples (version 1 files still load)
 FILE_EXTENSION = ".phtraj"
 
 FULL_STEPS_PER_REV = 200
@@ -53,6 +53,7 @@ MAX_COUNT = 0xFFFF
 U32 = 0xFFFFFFFF
 
 SHAPES = ("sinusoid", "gaussian", "triangle")
+CSV_SHAPE = "csv"  # the ideal trajectory is given as samples (Design.samples)
 GAUSS_N_SIGMA = 3.0  # the Gaussian width is derived from the period: ends at 3 sigma
 MAX_ABS_SKEW = 0.95
 
@@ -151,6 +152,11 @@ class Design:
     delay_spread_pct: float = 0.0
     skew_jitter: float = 0.0
     seed: int = 1
+    # shape "csv": the ideal trajectory as [time_s, position_deg] samples of
+    # one cycle (it repeats), and the file it came from; the parameters above
+    # are not used.
+    samples: Optional[list] = None
+    source: str = ""
 
 
 @dataclass
@@ -176,7 +182,11 @@ class Period:
 
 
 def generate_periods(design: Design) -> list[Period]:
-    """The per-period table; random irregularity is drawn from ``design.seed``."""
+    """The per-period table; random irregularity is drawn from ``design.seed``.
+    A CSV trajectory is one period: the whole cycle, with its peak position."""
+    if design.shape == CSV_SHAPE:
+        path = shape_of(design)
+        return [Period(path.duration_s * 1000.0, path.peak_deg, 0.0, 0.0)]
     if design.shape not in SHAPES:
         raise ValueError(f"unknown shape {design.shape!r}")
     k = int(design.n_periods)
@@ -282,6 +292,210 @@ def shape_inverse(shape: str, f, skew: float, rising: bool):
 
 
 # ----------------------------------------------------------------------------
+# Ideal trajectory given as samples (CSV)
+# ----------------------------------------------------------------------------
+
+MAX_CSV_SAMPLES = 1_000_000
+
+
+def read_trajectory_csv(path) -> np.ndarray:
+    """Read an ideal trajectory: rows of time and position (deg), one cycle.
+
+    Comma, semicolon, tab or space separated; lines starting with # are
+    skipped, as is a header row. The time is in seconds, or in milliseconds if
+    the header names it so (e.g. ``time_ms``). Returns an (n, 2) array of
+    [time_s, position_deg]."""
+    rows, header = [], None
+    with open(path, encoding="utf-8-sig") as fh:
+        for no, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            cells = [c for c in line.replace(";", ",").replace("\t", ",").replace(" ", ",").split(",") if c]
+            try:
+                vals = [float(c) for c in cells[:2]]
+            except ValueError:
+                if rows or header is not None:
+                    raise ValueError(f"line {no}: not a number: {line!r}") from None
+                fields = [c for c in line.replace(";", ",").replace("\t", ",").split(",") if c.strip()]
+                header = [c.strip().lower() for c in (fields if len(fields) > 1 else cells)]
+                continue
+            if len(vals) < 2:
+                raise ValueError(f"line {no}: expected time and position, got {line!r}")
+            rows.append(vals)
+            if len(rows) > MAX_CSV_SAMPLES:
+                raise ValueError(f"more than {MAX_CSV_SAMPLES} samples")
+    if not rows:
+        raise ValueError("no samples found")
+    a = np.array(rows, dtype=float)
+    if header and "ms" in header[0].replace("_", " ").replace("(", " ").replace(")", " ").replace("[", " ") \
+            .replace("]", " ").split():
+        a[:, 0] /= 1000.0
+    return a
+
+
+def design_from_csv(path, name: Optional[str] = None) -> Design:
+    """A Design whose ideal trajectory is the CSV (validated here)."""
+    import os
+    a = read_trajectory_csv(path)
+    SampledPath(a[:, 0], a[:, 1])  # validate
+    return Design(shape=CSV_SHAPE, samples=a.tolist(), source=name or os.path.basename(str(path)))
+
+
+def _pchip_slopes(h, delta):
+    """Fritsch-Carlson slopes at the knots of a periodic monotone cubic: the
+    curve is monotone between samples, and flat at every local extremum."""
+    dp = np.concatenate([[delta[-1]], delta])  # slope of the interval before each knot (wrapping)
+    dn = np.concatenate([delta, [delta[0]]])
+    hp = np.concatenate([[h[-1]], h])
+    hn = np.concatenate([h, [h[0]]])
+    m = np.zeros(len(dp))
+    same = (dp * dn) > 0
+    w1, w2 = 2 * hn + hp, hn + 2 * hp
+    with np.errstate(divide="ignore", invalid="ignore"):
+        hm = (w1 + w2) / (w1 / dp + w2 / dn)
+    m[same] = hm[same]
+    return m
+
+
+class SampledPath:
+    """The ideal motion through CSV samples, looped: a periodic monotone cubic
+    (PCHIP), so it never overshoots the samples and its speed is continuous,
+    also across the cycle wrap. Position is relative to the first sample."""
+
+    def __init__(self, t, x):
+        t, x = np.asarray(t, dtype=float), np.asarray(x, dtype=float)
+        if t.ndim != 1 or len(t) < 3 or len(t) != len(x):
+            raise ValueError("a CSV trajectory needs at least 3 samples")
+        if not (np.isfinite(t).all() and np.isfinite(x).all()):
+            raise ValueError("the CSV has non-numeric values")
+        if np.any(np.diff(t) <= 0):
+            k = int(np.argmax(np.diff(t) <= 0))
+            raise ValueError(f"time must increase: sample {k + 2} ({t[k + 1]:g} s) is not after {t[k]:g} s")
+        t, x = t - t[0], x - x[0]
+        if abs(x[-1]) > 1e-6:
+            raise ValueError(f"the trajectory must end where it starts, since it repeats: it ends "
+                             f"{x[-1]:+g} deg from its first sample (add a last row at the start position)")
+        x[-1] = 0.0
+        self.t, self.x = t, x
+        self.h = np.diff(t)
+        self.delta = np.diff(x) / self.h
+        self.m = _pchip_slopes(self.h, self.delta)
+        self.m[-1] = self.m[0]  # the same knot, at both ends of the cycle
+
+    @property
+    def duration_s(self) -> float:
+        return float(self.t[-1])
+
+    @property
+    def peak_deg(self) -> float:
+        return float(self.x[np.argmax(np.abs(self.x))])
+
+    def _locate(self, t):
+        t = np.mod(np.asarray(t, dtype=float), self.t[-1])
+        k = np.clip(np.searchsorted(self.t, t, side="right") - 1, 0, len(self.h) - 1)
+        return k, (t - self.t[k]) / self.h[k]
+
+    def position(self, t):
+        k, s = self._locate(t)
+        h, x0, x1, m0, m1 = self.h[k], self.x[k], self.x[k + 1], self.m[k], self.m[k + 1]
+        s2, s3 = s * s, s * s * s
+        return ((2 * s3 - 3 * s2 + 1) * x0 + (s3 - 2 * s2 + s) * h * m0
+                + (-2 * s3 + 3 * s2) * x1 + (s3 - s2) * h * m1)
+
+    def velocity(self, t):
+        k, s = self._locate(t)
+        h, x0, x1, m0, m1 = self.h[k], self.x[k], self.x[k + 1], self.m[k], self.m[k + 1]
+        s2 = s * s
+        return ((6 * s2 - 6 * s) * (x0 - x1) / h + (3 * s2 - 4 * s + 1) * m0 + (3 * s2 - 2 * s) * m1)
+
+    def accel(self, t):
+        k, s = self._locate(t)
+        h, x0, x1, m0, m1 = self.h[k], self.x[k], self.x[k + 1], self.m[k], self.m[k + 1]
+        return ((12 * s - 6) * (x0 - x1) / h + (6 * s - 4) * m0 + (6 * s - 2) * m1) / h
+
+    def _pieces(self):
+        """Monotone runs of samples: (first, last, +1/-1); flat runs are left out."""
+        sign = np.sign(self.delta)
+        out, i = [], 0
+        while i < len(sign):
+            j = i
+            while j + 1 < len(sign) and sign[j + 1] == sign[i]:
+                j += 1
+            if sign[i] != 0:
+                out.append((i, j + 1, int(sign[i])))
+            i = j + 1
+        return out
+
+    def turning_points(self):
+        """Sample indices where the motion turns (and both ends)."""
+        return sorted({0, len(self.x) - 1} | {i for a, b, _ in self._pieces() for i in (a, b)})
+
+    def quantization_deg(self, microstep: int) -> float:
+        """Largest change of a turning point by rounding it to whole microsteps."""
+        y = self.x[self.turning_points()] / deg_per_step(microstep)
+        return float(np.abs(np.round(y) - y).max() * deg_per_step(microstep))
+
+    def step_times(self, microstep: int):
+        """Like step_times for the shapes: every turning point is rounded to a
+        whole microstep, and between two of them a step is placed where the
+        curve, scaled to the rounded ends, crosses each level k + 0.5. So no
+        step chatters at a turn, and a cycle has zero net steps."""
+        y = self.x / deg_per_step(microstep)
+        times, dirs = [], []
+        for a, b, sign in self._pieces():
+            ya, yb = y[a], y[b]
+            na, nb = int(np.round(ya)), int(np.round(yb))
+            n = (nb - na) * sign
+            if n <= 0:
+                continue
+            levels = na + sign * (np.arange(n) + 0.5)
+            target = ya + (levels - na) * (yb - ya) / (nb - na)  # in the curve's own scale
+            seg = y[a:b + 1] * sign  # increasing
+            k = a + np.clip(np.searchsorted(seg, target * sign, side="right") - 1, 0, b - a - 1)
+            lo, hi = np.zeros(n), np.ones(n)
+            want = target * deg_per_step(microstep)
+            for _ in range(48):  # bisection inside the (monotone) interval k
+                mid = (lo + hi) / 2
+                above = (self.position(self.t[k] + mid * self.h[k]) - want) * sign > 0
+                hi = np.where(above, mid, hi)
+                lo = np.where(above, lo, mid)
+            times.append(self.t[k] + (lo + hi) / 2 * self.h[k])
+            dirs.append(np.full(n, sign))
+        if not times:
+            return np.zeros(0), np.zeros(0, dtype=int)
+        t, d = np.concatenate(times), np.concatenate(dirs).astype(int)
+        order = np.argsort(t, kind="stable")
+        return t[order], d[order]
+
+    def dense_time(self, per_interval: int = 16, max_points: int = 400_000):
+        n = max(2, min(per_interval, max_points // len(self.h)))
+        s = np.linspace(0.0, 1.0, n, endpoint=False)
+        t = (self.t[:-1, None] + s[None, :] * self.h[:, None]).ravel()
+        return t
+
+
+def shape_of(design: Design):
+    """The design's shape for the functions below: a name, or a SampledPath."""
+    if design.shape != CSV_SHAPE:
+        return design.shape
+    if not design.samples:
+        raise ValueError("no CSV trajectory loaded")
+    key = id(design.samples)
+    cached = _SAMPLED_CACHE.get(key)
+    if cached is None or cached[0] is not design.samples:
+        a = np.asarray(design.samples, dtype=float)
+        cached = (design.samples, SampledPath(a[:, 0], a[:, 1]))
+        if len(_SAMPLED_CACHE) > 8:
+            _SAMPLED_CACHE.clear()
+        _SAMPLED_CACHE[key] = cached
+    return cached[1]
+
+
+_SAMPLED_CACHE: dict = {}
+
+
+# ----------------------------------------------------------------------------
 # Ideal trajectory
 # ----------------------------------------------------------------------------
 
@@ -314,14 +528,20 @@ def _per_period(fn, power, shape, periods, t):
 
 
 def ideal_position_deg(shape, periods, t):
+    if isinstance(shape, SampledPath):
+        return shape.position(t)
     return _per_period(shape_value, 0, shape, periods, t)
 
 
 def ideal_velocity_dps(shape, periods, t):
+    if isinstance(shape, SampledPath):
+        return shape.velocity(t)
     return _per_period(shape_derivative, 1, shape, periods, t)
 
 
 def ideal_accel_dps2(shape, periods, t):
+    if isinstance(shape, SampledPath):
+        return shape.accel(t)
     return _per_period(shape_second_derivative, 2, shape, periods, t)
 
 
@@ -347,6 +567,8 @@ def step_times(shape: str, periods: list[Period], microstep: int):
     (k = 0..N-1), once on the rising and once on the falling branch, so every
     period has zero net steps and no step chatter at the turning point.
     """
+    if isinstance(shape, SampledPath):
+        return shape.step_times(microstep)
     starts = period_starts(periods)
     times, dirs = [], []
     for i, p in enumerate(periods):
@@ -808,20 +1030,24 @@ class CompiledTrajectory:
         return self.total_ticks / self.tick_hz
 
     def step_targets(self):
-        t, d = step_times(self.design.shape, self.periods, self.microstep)
+        t, d = step_times(shape_of(self.design), self.periods, self.microstep)
         return t * self.tick_hz, d
 
     def to_dict(self) -> dict:
+        design = dataclasses.asdict(self.design)
+        if not self.design.samples:  # readable by version 1 readers
+            design.pop("samples")
+            design.pop("source")
         return {
             "format": FORMAT_NAME,
-            "version": FORMAT_VERSION,
+            "version": FORMAT_VERSION if self.design.samples else 1,
             "created": self.created,
             "microstep": self.microstep,
             "driver": self.limits.driver,
             "tick_hz": self.tick_hz,
             "full_steps_per_rev": FULL_STEPS_PER_REV,
             "deg_per_full_step": DEG_PER_FULL_STEP,
-            "design": dataclasses.asdict(self.design),
+            "design": design,
             "limits": dataclasses.asdict(self.limits),
             "periods": [dataclasses.asdict(p) for p in self.periods],
             "segment_format": {"fields": ["count", "interval_fp", "add_fp", "add2_fp", "flags"],
@@ -877,7 +1103,9 @@ class CompiledTrajectory:
 # Metrics and curves
 # ----------------------------------------------------------------------------
 
-def _dense_time(periods, per_period=2000):
+def _dense_time(periods, per_period=2000, shape=None):
+    if isinstance(shape, SampledPath):
+        return shape.dense_time()
     starts = period_starts(periods)
     parts = []
     for i, p in enumerate(periods):
@@ -896,7 +1124,11 @@ def real_position_steps(event_ticks, event_dirs, t_ticks):
 
 
 def corner_speeds(shape, periods):
-    """|speed| (deg/s) at start, peak (both sides) and end of each period's motion."""
+    """|speed| (deg/s) at start, peak (both sides) and end of each period's motion.
+    A CSV trajectory has no single peak: only its speed at the cycle start."""
+    if isinstance(shape, SampledPath):
+        v = abs(float(shape.velocity(0.0)))
+        return np.array([[v, 0.0, 0.0, v]])
     out = []
     for p in periods:
         length = p.length_ms / 1000.0
@@ -909,9 +1141,9 @@ def corner_speeds(shape, periods):
 
 def compute_metrics(traj: CompiledTrajectory, ver: Verification, tau, dirs) -> dict:
     """Metrics of a verified trajectory; ``tau``/``dirs`` are its step targets."""
-    shape, periods, ms, f = traj.design.shape, traj.periods, traj.microstep, traj.tick_hz
+    shape, periods, ms, f = shape_of(traj.design), traj.periods, traj.microstep, traj.tick_hz
     real_ticks = ver.step_ticks
-    t = _dense_time(periods)
+    t = _dense_time(periods, shape=shape)
     vel = ideal_velocity_dps(shape, periods, t)
     acc = ideal_accel_dps2(shape, periods, t)
     dsteps = deg_per_step(ms)
@@ -941,8 +1173,9 @@ def compute_metrics(traj: CompiledTrajectory, ver: Verification, tau, dirs) -> d
         "max_timing_error_us": float(ver.max_error_ticks / f * 1e6),
         "min_event_gap_ticks": ver.min_gap_ticks,
         "max_position_error_deg": float(pos_err_max),
-        "amplitude_quantization_deg": float(max(abs(q - p.amplitude_deg) for q, p in
-                                                zip(quantized_amplitudes_deg(periods, ms), periods))),
+        "amplitude_quantization_deg": (shape.quantization_deg(ms) if isinstance(shape, SampledPath) else
+                                       float(max(abs(q - p.amplitude_deg) for q, p in
+                                                 zip(quantized_amplitudes_deg(periods, ms), periods)))),
         **stream_metrics(traj),
     }
 
@@ -957,14 +1190,14 @@ def stream_metrics(traj: "CompiledTrajectory") -> dict:
 
 def trajectory_curves(traj: CompiledTrajectory, n_cycles: int = 1, per_period: int = 1500):
     """Arrays for plotting: ideal vs real position, error, speed and step rate."""
-    shape, periods, f = traj.design.shape, traj.periods, traj.tick_hz
+    shape, periods, f = shape_of(traj.design), traj.periods, traj.tick_hz
     # Every cycle is identical: repeat the one-cycle simulation.
     times, kinds, levels = traj.events
     step = kinds == EV_STEP
     st = np.concatenate([times[step] + k * traj.total_ticks for k in range(n_cycles)])
     sd = np.tile(np.where(levels[step] == 1, 1, -1), n_cycles)
     total = traj.cycle_s
-    base = _dense_time(periods, per_period)
+    base = _dense_time(periods, per_period, shape)
     t = np.concatenate([base + k * total for k in range(n_cycles)])
     # Add the step instants (both sides) so the staircase is drawn exactly.
     ts = st / f
@@ -1038,7 +1271,8 @@ def limit_warnings(design: Design, limits: Limits, periods, metrics: dict) -> li
         w.append(f"peak acceleration {metrics['peak_accel_dps2']:.0f} deg/s^2 exceeds the limit "
                  f"{limits.max_accel_dps2:.0f} deg/s^2")
     if metrics["max_start_stop_speed_dps"] > limits.start_stop_speed_dps:
-        w.append(f"speed at the start/end of a period is {metrics['max_start_stop_speed_dps']:.0f} "
+        where = "the cycle" if design.shape == CSV_SHAPE else "a period"
+        w.append(f"speed at the start/end of {where} is {metrics['max_start_stop_speed_dps']:.0f} "
                  f"deg/s, above the start/stop limit {limits.start_stop_speed_dps:.0f} deg/s")
     if design.shape == "triangle":
         w.append(f"triangle reverses instantly at the peak (speed jumps by up to "
@@ -1048,7 +1282,8 @@ def limit_warnings(design: Design, limits: Limits, periods, metrics: dict) -> li
                  f"them while it plays and must stay connected; a PC stall longer than "
                  f"{metrics['stream_slack_ms']:.0f} ms aborts the run")
     if metrics["amplitude_quantization_deg"] > 1e-9:
-        w.append(f"amplitude rounded to whole microsteps (up to "
+        what = "turning points" if design.shape == CSV_SHAPE else "amplitude"
+        w.append(f"{what} rounded to whole microsteps (up to "
                  f"{metrics['amplitude_quantization_deg']:.4f} deg)")
     return w
 
@@ -1075,8 +1310,9 @@ def plan(design: Design, limits: Limits, caps: dict, periods: Optional[list[Peri
         return PlanResult(None, attempts, f"the sequence lasts {total_s / 60:.0f} min, longer than the "
                           f"{2 ** 32 / min(ticks) / 60:.0f} min one cycle can last at "
                           f"{limits.tolerance_us:g} us tolerance")
+    shape = shape_of(design)
     for ms in allowed:
-        t, d = step_times(design.shape, periods, ms)
+        t, d = step_times(shape, periods, ms)
         if len(t) == 0:
             attempts.append({"microstep": ms, "tick_hz": None, "result": "no steps (amplitude too small)"})
             continue

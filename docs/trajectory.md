@@ -31,6 +31,32 @@ and an absolute skew jitter. The K periods repeat every cycle. The generated
 per-period table is stored in the file, so a trajectory never depends on the
 random generator.
 
+### Ideal trajectory from a CSV
+
+Instead of a shape, the designer can take any ideal trajectory, such as a
+recorded breathing curve, from a CSV file (**Load CSV…**):
+
+```text
+time_ms,position_deg
+0,0
+20,0.31
+...
+12000,0
+```
+
+- Rows of time and position (deg) covering **one cycle**, which repeats.
+  Commas, semicolons, tabs or spaces; `#` lines and one header row are skipped.
+- Time in seconds, or in milliseconds when the header says so (`time_ms`,
+  `Time (ms)`). It must increase; it is counted from the first row.
+- Position is relative to the first row (that is where the phantom starts),
+  and the last row must return to it.
+
+Between the samples the motion is a periodic monotone cubic (PCHIP): it goes
+through every sample, never overshoots them, and its speed is continuous, also
+across the cycle wrap. Samples finer than a microstep apart are fine: wiggles
+smaller than a microstep make no steps. The samples are stored in the
+compiled file (format version 2), so it reproduces exactly.
+
 ## Steps
 
 ![Step placement](img/step_placement.png)
@@ -42,6 +68,12 @@ once on the way down. This gives:
 - zero net steps per period, so the phantom always returns exactly to 0;
 - no chatter at the peak;
 - a position error of at most ½ microstep, plus the timing tolerance.
+
+A CSV trajectory is handled the same way between its **turning points** (the
+samples where it changes direction): each turning point is rounded to whole
+microsteps, and between two of them a step is placed where the curve, scaled to
+the rounded ends, crosses each half-microstep level. The designer warns about
+the rounding, like the amplitude rounding of a shape.
 
 ## Segments
 
@@ -86,7 +118,8 @@ A compiled trajectory is a JSON file with:
 
 - format name and version;
 - microstep, driver, timer tick, steps/rev;
-- the designer parameters and limits, and the per-period table;
+- the designer parameters and limits, and the per-period table (and the
+  samples of a CSV trajectory);
 - the segments, cycle length in ticks, step count and checksum;
 - metrics, warnings, and the device capabilities it was compiled for.
 
