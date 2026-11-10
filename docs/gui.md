@@ -22,7 +22,7 @@ the ground truth. Trajectories come from the [designer](designer.md) or from a
 | 7 | **Trigger** and **Cycles** (0 = until Finish/STOP). The debug triggers show a warning that the motion is not synchronized. |
 | 8 | **Upload** (*Fill stream buffer* for streamed trajectories), **Arm / Start**, **Finish cycle** (stops at the end of the current cycle, back at 0) and **STOP** (immediate). |
 | 9 | **Progress**: upload progress, or the stream buffer level while playing. **Status** queries the cycle, position and overruns. |
-| 10 | **Manual move**: **Jog** a number of steps at a rate, **Set zero**. |
+| 10 | **Manual move**: **Jog** a number of steps at a rate, **Set zero** marks the current position as 0, **Go to zero** moves back there at the jog rate (STOP ends it). |
 | 11 | **Log** of every line sent (`>`) and received (`<`), with events and errors coloured. |
 
 ## Triggers

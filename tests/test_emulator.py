@@ -269,6 +269,21 @@ def test_jog_and_zero(rig):
     assert dev.status()["pos"] == 0
 
 
+def test_home_returns_to_zero(rig):
+    emu, dev = rig
+    dev.jog(-30, 4000)
+    dev.wait_event("EV DONE", timeout=30)
+    assert dev.home(4000) == 30
+    assert dev.status()["pos"] == 0
+    # 30 steps with DIR low, then 30 back with DIR high
+    trace = emu.trace()
+    rise = edges(trace, "step", 1)
+    assert len(rise) == 60
+    dir_at = lambda c: max(((cc, v) for cc, p, v in trace if p == "dir" and cc < c), default=(0, 0))[1]
+    assert [dir_at(c) for c in rise] == [0] * 30 + [1] * 30
+    assert dev.home(4000) == 0  # already there: nothing moves
+
+
 # -- streaming -----------------------------------------------------------------
 
 def stream_design():

@@ -55,6 +55,8 @@ class PhantomDevice:
         self._uploading = False
         self._wlock = threading.Lock()  # one writer at a time: lines never interleave
         self.session: Optional["StreamSession"] = None
+        self._homing = False
+        self._home_stop = False  # STOP was asked during home()
 
     # -- connection ---------------------------------------------------------
     def open(self) -> dict:
@@ -292,6 +294,9 @@ class PhantomDevice:
     def stop(self) -> int:
         if self.session is not None:
             self.session.stopping = True
+        if self._homing:
+            self._home_stop = True
+            self._events.put("EV STOP host")  # STOP sends no event: end home()
         line = self.command("STOP")
         if self.session is not None:
             self.session.detach()
@@ -309,6 +314,33 @@ class PhantomDevice:
     def jog(self, steps: int, rate_hz: int) -> None:
         self.clear_events()
         self.command(f"JOG {int(steps)} {int(rate_hz)}")
+
+    def home(self, rate_hz: int) -> int:
+        """Move back to position 0 (set by ZERO) at ``rate_hz`` and wait until
+        there. A JOG moves at most 65535 steps, so a longer way back takes
+        several; STOP ends it. Returns the number of steps moved."""
+        moved = 0
+        self._homing, self._home_stop = True, False
+        try:
+            while True:
+                pos = int(self.status()["pos"])
+                if pos == 0:
+                    return moved
+                steps = max(-65535, min(65535, -pos))
+                self.jog(steps, rate_hz)
+                if self._home_stop:  # STOP came before this JOG: undo it
+                    self.command("STOP")
+                    raise DeviceError("stopped")
+                timeout = abs(steps) / rate_hz + 5.0
+                for want in ("EV START", "EV DONE"):
+                    line = self.wait_event("EV ", timeout=timeout)
+                    if line == "EV STOP host" or self._home_stop:
+                        raise DeviceError("stopped")
+                    if not line.startswith(want):
+                        raise DeviceError(f"unexpected {line!r}")
+                moved += abs(steps)
+        finally:
+            self._homing = False
 
 
 class StreamSession:

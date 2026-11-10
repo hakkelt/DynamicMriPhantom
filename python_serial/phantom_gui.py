@@ -186,6 +186,8 @@ class PhantomApp:
         self.zero_btn.pack(side=tk.RIGHT)
         self.jog_btn = ttk.Button(j, text="Jog", command=self.jog)
         self.jog_btn.pack(side=tk.RIGHT, padx=4)
+        self.home_btn = ttk.Button(mf, text="Go to zero", command=self.home)
+        self.home_btn.pack(fill=tk.X, pady=(6, 0))
 
         # Bottom: serial log.
         lf = ps.card(body, "Log")
@@ -340,7 +342,7 @@ class PhantomApp:
         self.arm_btn.configure(state=tk.NORMAL if (can_upload and on_device) else tk.DISABLED)
         for btn in (self.stop_btn, self.finish_btn, self.status_btn):
             btn.configure(state=tk.NORMAL if connected else tk.DISABLED)
-        for btn in (self.jog_btn, self.zero_btn):
+        for btn in (self.jog_btn, self.zero_btn, self.home_btn):
             btn.configure(state=tk.NORMAL if connected and not self.running else tk.DISABLED)
         for btn in (self.save_btn, self.export_btn):
             btn.configure(state=tk.NORMAL if t is not None else tk.DISABLED)
@@ -597,6 +599,18 @@ class PhantomApp:
         except ValueError:
             return
         self._run("JOG", lambda d: d.jog(steps, rate))
+
+    def home(self) -> None:
+        """Move back to the position set with Set zero, at the jog rate."""
+        try:
+            rate = int(self.jog_rate.get())
+        except ValueError:
+            return
+
+        def done(moved):
+            self.state_label.configure(text=f"at zero ({moved} steps moved)")
+
+        self._run("Go to zero", lambda d: d.home(rate), done)
 
     def close(self) -> None:
         if self.dev:
