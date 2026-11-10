@@ -204,3 +204,54 @@ def style_axes(ax) -> None:
     ax.xaxis.label.set_fontsize(9)
     ax.grid(True, color="#e8ecf1", lw=0.8)
     ax.set_axisbelow(True)
+
+
+class Tooltip:
+    """Help text shown when the pointer rests on a widget (also when disabled)."""
+
+    DELAY_MS = 500
+
+    def __init__(self, widget, text: str):
+        self.widget, self.text = widget, text
+        self._after = None
+        self._win = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None) -> None:
+        self._cancel()
+        self._after = self.widget.after(self.DELAY_MS, self.show)
+
+    def _cancel(self) -> None:
+        if self._after is not None:
+            self.widget.after_cancel(self._after)
+            self._after = None
+
+    def show(self) -> None:
+        self._after = None
+        if self._win is not None or not self.widget.winfo_exists():
+            return
+        x = self.widget.winfo_rootx() + 8
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self._win = w = tk.Toplevel(self.widget)
+        w.wm_overrideredirect(True)
+        w.wm_geometry(f"+{x}+{y}")
+        tk.Label(w, text=self.text, justify=tk.LEFT, wraplength=340, background=TEXT, foreground=SURFACE,
+                 padx=8, pady=5, font=(tkfont.nametofont("TkDefaultFont").actual("family"), 9)).pack()
+        w.update_idletasks()  # keep it on the screen
+        x = max(0, min(x, w.winfo_screenwidth() - w.winfo_reqwidth() - 4))
+        y = min(y, w.winfo_screenheight() - w.winfo_reqheight() - 4)
+        w.wm_geometry(f"+{x}+{y}")
+
+    def _hide(self, _event=None) -> None:
+        self._cancel()
+        if self._win is not None:
+            self._win.destroy()
+            self._win = None
+
+
+def tip(text: str, *widgets) -> None:
+    """Attach the same tooltip to each widget (e.g. a field and its label)."""
+    for w in widgets:
+        w.tooltip = Tooltip(w, text)

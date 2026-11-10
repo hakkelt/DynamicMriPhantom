@@ -37,6 +37,37 @@ def _plan_with_curves(design, limits, caps):
     return res, (pc.trajectory_curves(res.trajectory) if res.trajectory else None)
 
 
+# Tooltips of the designer's fields, by parameter.
+TIPS = {
+    "shape": "Shape of one period: sinusoid (zero speed at the ends and the peak), Gaussian, "
+             "or triangle (constant speed, sharp corners).",
+    "amplitude_deg": "Peak rotation of a period, in degrees from the rest position.",
+    "length_ms": "Duration of one period, rest to peak and back, without the delay.",
+    "skew": "Where the peak sits: 0 = in the middle, positive = later (slow rise, fast fall), "
+            "negative = earlier. Between -0.95 and 0.95.",
+    "delay_ms": "Rest time at 0 after each period, before the next one.",
+    "n_periods": "Number of distinct periods drawn with the spreads below. They play in order and "
+                 "repeat every cycle. More periods take more memory; above the device's memory "
+                 "the trajectory is streamed.",
+    "length_spread_pct": "Each period's length is drawn uniformly within ± this % of the period length.",
+    "amplitude_spread_pct": "Each period's amplitude is drawn uniformly within ± this % of the amplitude.",
+    "delay_spread_pct": "Each period's delay is drawn uniformly within ± this % of the delay.",
+    "skew_jitter": "Each period's skewness is drawn uniformly within ± this value of the skewness.",
+    "seed": "Random seed of the irregularity: the same seed gives the same periods.",
+    "driver": "The stepper driver on the board: it sets the microsteps available and the mode pins.",
+    "microsteps": "Microstep modes the planner may use. It tries the finest first and takes the first "
+                  "that fits the step rate, memory and timing.",
+    "max_speed_dps": "Speed limit of the motor and the phantom. Exceeding it is a warning, not an error.",
+    "max_accel_dps2": "Acceleration limit. Exceeding it is a warning, not an error.",
+    "start_stop_speed_dps": "Highest speed the motor can start or stop at without missing steps "
+                            "(the speed at the ends of a period). Exceeding it is a warning.",
+    "tolerance_us": "Largest allowed timing error of each step against the ideal motion. Smaller is "
+                    "more exact but needs more segments.",
+    "target": "Device to compile for: the connected one (its real capabilities), or a board's "
+              "defaults to work offline.",
+}
+
+
 class DesignerWindow(tk.Toplevel):
     def __init__(self, master, on_send: Optional[Callable[[pc.CompiledTrajectory], None]] = None,
                  get_caps: Optional[Callable[[], Optional[dict]]] = None,
@@ -80,11 +111,14 @@ class DesignerWindow(tk.Toplevel):
         self._entry(irr, "delay_spread_pct", "Delay spread (%)", d.delay_spread_pct, 3)
         self._entry(irr, "skew_jitter", "Skew jitter (abs)", d.skew_jitter, 4)
         self._entry(irr, "seed", "Seed", d.seed, 5)
-        ttk.Button(irr, text="New seed", command=self._new_seed).grid(row=5, column=2, padx=2)
+        seed_btn = ttk.Button(irr, text="New seed", command=self._new_seed)
+        seed_btn.grid(row=5, column=2, padx=2)
+        ps.tip("Draw a random seed: another set of K periods with the same spreads.", seed_btn)
 
         drv = ps.card(left, "Driver and limits", fill=tk.X, pady=(6, 0))
         self._combo(drv, "driver", "Driver", tuple(pc.DRIVERS), lim.driver, 0)
-        ttk.Label(drv, text="Microsteps", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 6))
+        ms_lbl = ttk.Label(drv, text="Microsteps", style="Card.TLabel")
+        ms_lbl.grid(row=1, column=0, sticky="w", padx=(0, 6))
         msf = ttk.Frame(drv, style="Card.TFrame")
         msf.grid(row=1, column=1, columnspan=2, sticky="w", pady=2)
         self._ms_checks = {}
@@ -94,6 +128,8 @@ class DesignerWindow(tk.Toplevel):
             cb = ttk.Checkbutton(msf, text=f"1/{m}", variable=v)
             cb.pack(side=tk.LEFT)
             self._ms_checks[m] = cb
+            ps.tip(TIPS["microsteps"], cb)
+        ps.tip(TIPS["microsteps"], ms_lbl)
         self._entry(drv, "max_speed_dps", "Max speed (deg/s)", lim.max_speed_dps, 2)
         self._entry(drv, "max_accel_dps2", "Max acceleration (deg/s²)", lim.max_accel_dps2, 3)
         self._entry(drv, "start_stop_speed_dps", "Start/stop speed (deg/s)", lim.start_stop_speed_dps, 4)
@@ -111,6 +147,11 @@ class DesignerWindow(tk.Toplevel):
         self.save_btn.pack(side=tk.LEFT, padx=4)
         self.send_btn = ttk.Button(btns, text="Use in main window →", command=self.send, state=tk.DISABLED)
         self.send_btn.pack(side=tk.LEFT)
+        ps.tip("Plan the trajectory for the target: pick the microstep and tick, fit the segments and "
+               "check the limits. The plots and the Result tab show what the device will play.",
+               self.compile_btn)
+        ps.tip("Save the compiled trajectory as a .phtraj file.", self.save_btn)
+        ps.tip("Load the compiled trajectory into the main window, ready to upload.", self.send_btn)
         if self.on_send is None:
             self.send_btn.pack_forget()
 
@@ -158,26 +199,34 @@ class DesignerWindow(tk.Toplevel):
             self._vars[key].trace_add("write", lambda *_: self._update_periods())
 
     def _label(self, parent, text, row):
-        ttk.Label(parent, text=text, style="Card.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 6), pady=2)
+        lbl = ttk.Label(parent, text=text, style="Card.TLabel")
+        lbl.grid(row=row, column=0, sticky="w", padx=(0, 6), pady=2)
+        return lbl
 
     def _entry(self, parent, key, text, value, row):
-        self._label(parent, text, row)
+        lbl = self._label(parent, text, row)
         v = tk.StringVar(value=str(value))
         self._vars[key] = v
-        ttk.Entry(parent, textvariable=v, width=12).grid(row=row, column=1, sticky="w")
+        w = ttk.Entry(parent, textvariable=v, width=12)
+        w.grid(row=row, column=1, sticky="w")
+        ps.tip(TIPS[key], lbl, w)
 
     def _spin(self, parent, key, text, value, lo, hi, row):
-        self._label(parent, text, row)
+        lbl = self._label(parent, text, row)
         v = tk.StringVar(value=str(value))
         self._vars[key] = v
-        ttk.Spinbox(parent, from_=lo, to=hi, textvariable=v, width=10).grid(row=row, column=1, sticky="w")
+        w = ttk.Spinbox(parent, from_=lo, to=hi, textvariable=v, width=10)
+        w.grid(row=row, column=1, sticky="w")
+        ps.tip(TIPS[key], lbl, w)
 
     def _combo(self, parent, key, text, values, value, row):
-        self._label(parent, text, row)
+        lbl = self._label(parent, text, row)
         v = tk.StringVar(value=value)
         self._vars[key] = v
-        ttk.Combobox(parent, textvariable=v, values=list(values), state="readonly",
-                     width=26 if key == "target" else 12).grid(row=row, column=1, columnspan=2, sticky="w")
+        w = ttk.Combobox(parent, textvariable=v, values=list(values), state="readonly",
+                         width=26 if key == "target" else 12)
+        w.grid(row=row, column=1, columnspan=2, sticky="w")
+        ps.tip(TIPS[key], lbl, w)
 
     # -- parameters ---------------------------------------------------------
     def _driver_changed(self) -> None:

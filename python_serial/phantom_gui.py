@@ -36,13 +36,47 @@ TRIGGER_LABELS = {
 assert set(TRIGGER_LABELS) == set(TRIGGERS)
 
 
-def list_ports() -> list[str]:
+# USB vendor (and product) ids of the boards this controller runs on and of
+# the USB-serial chips on their clones: (vid, pid or None for any) -> name.
+USB_NAMES = {
+    (0x2341, None): "Arduino",
+    (0x2A03, None): "Arduino",
+    (0x1A86, 0x7523): "Arduino clone (CH340)",
+    (0x1A86, 0x55D3): "ESP32-S3 DevKit (CH343)",
+    (0x1A86, None): "USB serial (WCH)",
+    (0x0403, None): "USB serial (FTDI)",
+    (0x10C4, None): "USB serial (CP210x)",
+    (0x303A, None): "ESP32-S3 (native USB)",
+}
+
+
+def port_name(info) -> Optional[str]:
+    """A readable name for a pyserial ListPortInfo, or None if it is not a USB
+    port. Boards are all USB, so anything else (the built-in ttyS*, Bluetooth,
+    ports with no device behind them) is left out."""
+    if info.vid is None:
+        return None
+    name = USB_NAMES.get((info.vid, info.pid)) or USB_NAMES.get((info.vid, None))
+    product = (info.product or "").strip()
+    if info.vid in (0x2341, 0x2A03) and product.startswith("Arduino"):
+        name = product  # e.g. "Arduino Uno"
+    if name is None:
+        name = product or (info.description or "").strip() or "USB serial"
+    return f"{name} — {info.device}"
+
+
+def list_ports() -> list[tuple[str, str]]:
+    """(label, port) for every connected USB serial port, known boards first,
+    then the emulator."""
     try:
         from serial.tools import list_ports as lp
-        ports = [p.device for p in lp.comports()]
+        infos = list(lp.comports())
     except Exception:
-        ports = []
-    return ports + [EMULATOR_URL]
+        infos = []
+    known = {v for v, _ in USB_NAMES}
+    ports = sorted(((port_name(i), i.device, i.vid in known) for i in infos if port_name(i)),
+                   key=lambda t: (not t[2], t[1]))
+    return [(label, dev) for label, dev, _ in ports] + [(f"Emulator — {EMULATOR_URL}", EMULATOR_URL)]
 
 
 class PhantomApp:
@@ -84,15 +118,24 @@ class PhantomApp:
         self.state_badge.pack(side=tk.RIGHT, padx=(10, 0))
         conn = ttk.Frame(head, style="Card.TFrame")
         conn.pack(side=tk.RIGHT)
-        ttk.Label(conn, text="Port", style="Muted.TLabel").pack(side=tk.LEFT)
+        port_lbl = ttk.Label(conn, text="Port", style="Muted.TLabel")
+        port_lbl.pack(side=tk.LEFT)
         self.port_var = tk.StringVar()
-        self.port_box = ttk.Combobox(conn, textvariable=self.port_var, values=list_ports(), width=28)
+        self.port_box = ttk.Combobox(conn, textvariable=self.port_var, width=30)
         self.port_box.pack(side=tk.LEFT, padx=6)
-        if self.port_box["values"]:
-            self.port_var.set(self.port_box["values"][0])
-        ttk.Button(conn, text="Rescan", command=self._refresh_ports).pack(side=tk.LEFT)
+        self._ports: dict[str, str] = {}  # label shown -> port
+        self._refresh_ports()
+        ps.tip("The controller board: connected USB serial ports by name, and the emulator. "
+               "A port (COM5, /dev/ttyACM0) or a socket:// URL can also be typed in.", port_lbl, self.port_box)
+        rescan = ttk.Button(conn, text="Rescan", command=self._refresh_ports)
+        rescan.pack(side=tk.LEFT)
+        ps.tip("Look for serial ports again, e.g. after plugging in a board.", rescan)
         self.connect_btn = ttk.Button(conn, text="Connect", style="Accent.TButton", command=self.toggle_connect)
         self.connect_btn.pack(side=tk.LEFT, padx=(6, 0))
+        ps.tip("Connect to the selected port and read the device's capabilities (board, memory, tick "
+               "rates, step rate), or disconnect.", self.connect_btn)
+        ps.tip("State of the controller: offline, idle, loading, ready, armed, running, or ABORTED.",
+               self.state_badge)
 
         body = ttk.Frame(outer)
         body.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
@@ -104,12 +147,20 @@ class PhantomApp:
         tf.grid(row=0, column=0, sticky="nsew")
         bar = ttk.Frame(tf, style="Card.TFrame")
         bar.pack(fill=tk.X)
-        ttk.Button(bar, text="Open…", command=self.open_file).pack(side=tk.LEFT)
+        open_btn = ttk.Button(bar, text="Open…", command=self.open_file)
+        open_btn.pack(side=tk.LEFT)
+        ps.tip("Open a compiled trajectory (.phtraj).", open_btn)
         self.save_btn = ttk.Button(bar, text="Save…", command=self.save_file)
         self.save_btn.pack(side=tk.LEFT, padx=4)
-        ttk.Button(bar, text="Designer…", style="Accent.TButton", command=self.open_designer).pack(side=tk.LEFT)
+        ps.tip("Save the loaded trajectory as a .phtraj file.", self.save_btn)
+        design_btn = ttk.Button(bar, text="Designer…", style="Accent.TButton", command=self.open_designer)
+        design_btn.pack(side=tk.LEFT)
+        ps.tip("Design a new trajectory from a shape and its parameters, and compile it for the device.",
+               design_btn)
         self.export_btn = ttk.Button(bar, text="Export ground truth…", command=self.export_ground_truth)
         self.export_btn.pack(side=tk.RIGHT)
+        ps.tip("Save the exact position over time that the device plays (CSV), to compare with "
+               "the MRI images. Time zero is the start of the sequence.", self.export_btn)
         self.summary = ps.rich_text(tf, height=13, width=60)
         self.summary.pack(fill=tk.BOTH, expand=True, pady=(8, 4))
         self.compat_label = ttk.Label(tf, text="", wraplength=560, style="Card.TLabel")
@@ -121,33 +172,49 @@ class PhantomApp:
         jf = ps.card(side, "Microstep mode pins", fill=tk.X)
         row = ttk.Frame(jf, style="Card.TFrame")
         row.pack(fill=tk.X)
-        ttk.Label(row, text="Driver", style="Card.TLabel").pack(side=tk.LEFT)
+        drv_lbl = ttk.Label(row, text="Driver", style="Card.TLabel")
+        drv_lbl.pack(side=tk.LEFT)
         self.driver_var = tk.StringVar(value="DRV8825")
-        ttk.Combobox(row, textvariable=self.driver_var, values=list(pc.DRIVERS), state="readonly",
-                     width=10).pack(side=tk.LEFT, padx=6)
+        drv_box = ttk.Combobox(row, textvariable=self.driver_var, values=list(pc.DRIVERS), state="readonly",
+                               width=10)
+        drv_box.pack(side=tk.LEFT, padx=6)
+        ps.tip("The stepper driver on the board: it sets which mode pin setting gives which microstep.",
+               drv_lbl, drv_box)
         self.driver_var.trace_add("write", lambda *_: self._driver_changed())
         self.jumper_canvas = tk.Canvas(jf, width=300, height=88, background=ps.SURFACE,
                                        highlightthickness=0)
         self.jumper_canvas.pack(fill=tk.X, pady=(8, 2))
+        ps.tip("Set the driver's mode pins (DIP switch or jumpers) like this for the trajectory's "
+               "microstep. The firmware cannot read them.", self.jumper_canvas)
         self.jumper_label = ttk.Label(jf, text="", wraplength=300, justify=tk.LEFT, style="Muted.TLabel")
         self.jumper_label.pack(fill=tk.X, pady=(0, 4))
         self.jumpers_ok = tk.BooleanVar(value=False)
         self.jumper_check = ttk.Checkbutton(jf, text="Mode pins are set as shown", variable=self.jumpers_ok,
                                             command=self._refresh)
         self.jumper_check.pack(anchor="w")
+        ps.tip("Confirm that the mode pins are set as shown. A wrong setting scales the whole motion. "
+               "Required before upload, for every new trajectory.", self.jumper_check)
 
         rf = ps.card(side, "Run", fill=tk.X, pady=(8, 0))
         g = ttk.Frame(rf, style="Card.TFrame")
         g.pack(fill=tk.X)
-        ttk.Label(g, text="Trigger", style="Card.TLabel").grid(row=0, column=0, sticky="w", pady=2)
+        trig_lbl = ttk.Label(g, text="Trigger", style="Card.TLabel")
+        trig_lbl.grid(row=0, column=0, sticky="w", pady=2)
         self.trigger_label = tk.StringVar(value=TRIGGER_LABELS["ttl"])
-        ttk.Combobox(g, textvariable=self.trigger_label, values=list(TRIGGER_LABELS.values()),
-                     state="readonly", width=30).grid(row=0, column=1, sticky="w", padx=(8, 0))
-        ttk.Label(g, text="Cycles", style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=2)
+        trig_box = ttk.Combobox(g, textvariable=self.trigger_label, values=list(TRIGGER_LABELS.values()),
+                                state="readonly", width=30)
+        trig_box.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ps.tip("What starts the motion once armed: the MRI TTL pulse at the start of the sequence "
+               "(synchronized), or for testing the board's button or at once.", trig_lbl, trig_box)
+        cyc_lbl = ttk.Label(g, text="Cycles", style="Card.TLabel")
+        cyc_lbl.grid(row=1, column=0, sticky="w", pady=2)
         cyc = ttk.Frame(g, style="Card.TFrame")
         cyc.grid(row=1, column=1, sticky="w", padx=(8, 0))
         self.cycles_var = tk.StringVar(value="0")
-        ttk.Spinbox(cyc, from_=0, to=1_000_000, textvariable=self.cycles_var, width=8).pack(side=tk.LEFT)
+        cyc_box = ttk.Spinbox(cyc, from_=0, to=1_000_000, textvariable=self.cycles_var, width=8)
+        cyc_box.pack(side=tk.LEFT)
+        ps.tip("How many times to play the whole trajectory (all K periods). 0 repeats it until "
+               "STOP or Finish cycle.", cyc_lbl, cyc_box)
         ttk.Label(cyc, text="0 = until stopped", style="Muted.TLabel").pack(side=tk.LEFT, padx=6)
         self.trigger_warning = ttk.Label(g, text="", style="Warn.TLabel", wraplength=300)
         self.trigger_warning.grid(row=2, column=0, columnspan=2, sticky="w")
@@ -164,30 +231,55 @@ class PhantomApp:
         self.finish_btn.grid(row=1, column=0, sticky="ew", padx=(0, 3), pady=(6, 0))
         self.stop_btn = ttk.Button(b, text="STOP", style="Big.Danger.TButton", command=self.stop)
         self.stop_btn.grid(row=1, column=1, sticky="ew", padx=(3, 0), pady=(6, 0))
+        ps.tip("Send the trajectory to the device, which checks its checksum. A trajectory too long for "
+               "the device's memory is streamed instead: this fills the buffer, and the PC must stay "
+               "connected while it plays.", self.upload_btn)
+        ps.tip("Arm the device with the trigger and cycles above; it starts on the trigger.", self.arm_btn)
+        ps.tip("Stop at the end of the current cycle, back at the start position.", self.finish_btn)
+        ps.tip("Stop the motor at once, where it is.", self.stop_btn)
         self.progress = ttk.Progressbar(rf, mode="determinate")
         self.progress.pack(fill=tk.X, pady=(4, 2))
+        ps.tip("Upload progress, or how full the device's stream buffer is while a streamed "
+               "trajectory plays.", self.progress)
         s = ttk.Frame(rf, style="Card.TFrame")
         s.pack(fill=tk.X, pady=(2, 0))
         self.status_btn = ttk.Button(s, text="Status", command=self.status)
         self.status_btn.pack(side=tk.LEFT)
+        ps.tip("Ask the device for its state, cycle, position and overruns (steps fired late; should be 0).",
+               self.status_btn)
         self.state_label = ttk.Label(s, text="", style="Muted.TLabel", wraplength=230)
         self.state_label.pack(side=tk.LEFT, padx=8)
 
         mf = ps.card(side, "Manual move", fill=tk.X, pady=(8, 0))
         j = ttk.Frame(mf, style="Card.TFrame")
         j.pack(fill=tk.X)
-        ttk.Label(j, text="Steps", style="Card.TLabel").pack(side=tk.LEFT)
+        steps_lbl = ttk.Label(j, text="Steps", style="Card.TLabel")
+        steps_lbl.pack(side=tk.LEFT)
         self.jog_steps = tk.StringVar(value="100")
-        ttk.Entry(j, textvariable=self.jog_steps, width=7).pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Label(j, text="Rate (Hz)", style="Card.TLabel").pack(side=tk.LEFT)
+        steps_box = ttk.Entry(j, textvariable=self.jog_steps, width=6)
+        steps_box.pack(side=tk.LEFT, padx=(4, 8))
+        ps.tip("Steps to jog, in the current microstep mode; negative moves the other way.",
+               steps_lbl, steps_box)
+        rate_lbl = ttk.Label(j, text="Hz", style="Card.TLabel")
+        rate_lbl.pack(side=tk.LEFT)
         self.jog_rate = tk.StringVar(value="1000")
-        ttk.Entry(j, textvariable=self.jog_rate, width=6).pack(side=tk.LEFT, padx=4)
-        self.zero_btn = ttk.Button(j, text="Set zero", command=lambda: self._run("ZERO", lambda d: d.zero()))
-        self.zero_btn.pack(side=tk.RIGHT)
-        self.jog_btn = ttk.Button(j, text="Jog", command=self.jog)
-        self.jog_btn.pack(side=tk.RIGHT, padx=4)
-        self.home_btn = ttk.Button(mf, text="Go to zero", command=self.home)
-        self.home_btn.pack(fill=tk.X, pady=(6, 0))
+        rate_box = ttk.Entry(j, textvariable=self.jog_rate, width=6)
+        rate_box.pack(side=tk.LEFT, padx=4)
+        ps.tip("Step rate of Jog and Go to zero, in steps per second.", rate_lbl, rate_box)
+        self.home_btn = ttk.Button(j, text="Go to zero", width=10, command=self.home)
+        self.home_btn.pack(side=tk.RIGHT)
+        ps.tip("Move back to the position marked with Mark as zero, at the rate above. STOP ends it.",
+               self.home_btn)
+        self.zero_btn = ttk.Button(j, text="Mark as zero", width=12,
+                                   command=lambda: self._run("ZERO", lambda d: d.zero()))
+        self.zero_btn.pack(side=tk.RIGHT, padx=4)
+        ps.tip("Make the current position the zero. The controller has no end stop: its position is "
+               "only a step count, from power-on until marked. Jog the phantom to its reference "
+               "(e.g. centred) and press this once; Go to zero and the abort message then refer to it.",
+               self.zero_btn)
+        self.jog_btn = ttk.Button(j, text="Jog", width=5, command=self.jog)
+        self.jog_btn.pack(side=tk.RIGHT)
+        ps.tip("Move the given number of steps at the given rate.", self.jog_btn)
 
         # Bottom: serial log.
         lf = ps.card(body, "Log")
@@ -268,7 +360,17 @@ class PhantomApp:
             "Debug trigger: the motion is NOT synchronized to the MRI sequence.")
 
     def _refresh_ports(self) -> None:
-        self.port_box["values"] = list_ports()
+        """Show the connected USB ports by name; a port or URL can still be typed."""
+        current, old = self.port_var.get(), self._ports
+        self._ports = dict(list_ports())
+        self.port_box["values"] = list(self._ports)
+        # keep a typed port, or a listed one that is still there
+        if not current or (current in old and current not in self._ports):
+            self.port_var.set(next(iter(self._ports)))
+
+    def _selected_port(self) -> str:
+        text = self.port_var.get().strip()
+        return self._ports.get(text, text)
 
     def _caps(self) -> Optional[dict]:
         return self.dev.caps if self.dev else None
@@ -412,7 +514,7 @@ class PhantomApp:
         if self.dev is not None:
             self.disconnect()
             return
-        port = self.port_var.get().strip()
+        port = self._selected_port()
         if not port:
             return
         self.connect_btn.configure(state=tk.DISABLED)
@@ -601,7 +703,7 @@ class PhantomApp:
         self._run("JOG", lambda d: d.jog(steps, rate))
 
     def home(self) -> None:
-        """Move back to the position set with Set zero, at the jog rate."""
+        """Move back to the position marked with Mark as zero, at the jog rate."""
         try:
             rate = int(self.jog_rate.get())
         except ValueError:

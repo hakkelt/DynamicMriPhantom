@@ -17,6 +17,7 @@ if not os.environ.get("DISPLAY"):
 
 import emulator as emumod  # noqa: E402
 import phantom_core as pc  # noqa: E402
+import phantom_gui  # noqa: E402
 from phantom_gui import TRIGGER_LABELS, PhantomApp  # noqa: E402
 
 
@@ -173,3 +174,65 @@ def test_streamed_run_and_abort_alarm(app, hex_path, monkeypatch):
     finally:
         app.disconnect()
         emu.stop()
+
+
+def test_port_list_shows_only_usb_ports_by_name(app, monkeypatch):
+    from serial.tools import list_ports
+    from serial.tools.list_ports_common import ListPortInfo
+
+    def port(device, vid=None, pid=None, product=None):
+        p = ListPortInfo(device, skip_link_detection=True)
+        p.vid, p.pid, p.product = vid, pid, product
+        return p
+
+    found = [port("/dev/ttyS0"), port("/dev/ttyS1"),  # built-in UARTs, mostly nothing behind them
+             port("/dev/ttyUSB0", 0x1A86, 0x7523),
+             port("/dev/ttyACM1", 0x303A, 0x1001),
+             port("/dev/ttyACM0", 0x2341, 0x0043, "Arduino Uno"),
+             port("/dev/ttyACM2", 0x1234, 0x5678, "Some Gadget")]
+    monkeypatch.setattr(list_ports, "comports", lambda: found)
+    assert phantom_gui.list_ports() == [
+        ("Arduino Uno — /dev/ttyACM0", "/dev/ttyACM0"),
+        ("ESP32-S3 (native USB) — /dev/ttyACM1", "/dev/ttyACM1"),
+        ("Arduino clone (CH340) — /dev/ttyUSB0", "/dev/ttyUSB0"),
+        ("Some Gadget — /dev/ttyACM2", "/dev/ttyACM2"),
+        (f"Emulator — {phantom_gui.EMULATOR_URL}", phantom_gui.EMULATOR_URL),
+    ]
+    app.port_var.set("")
+    app._refresh_ports()
+    assert app.port_var.get() == "Arduino Uno — /dev/ttyACM0"
+    assert app._selected_port() == "/dev/ttyACM0"
+    # a typed port or URL is used as it is and survives a rescan
+    app.port_var.set("socket://127.0.0.1:6000")
+    app._refresh_ports()
+    assert app._selected_port() == "socket://127.0.0.1:6000"
+    # the selected board was unplugged: fall back to the first one listed
+    app.port_var.set("Arduino Uno — /dev/ttyACM0")
+    found.pop(4)
+    app._refresh_ports()
+    assert app.port_var.get() == "ESP32-S3 (native USB) — /dev/ttyACM1"
+
+
+def _controls(widget):
+    kinds = (tk.ttk.Button, tk.ttk.Entry, tk.ttk.Combobox, tk.ttk.Spinbox, tk.ttk.Checkbutton)
+    for w in widget.winfo_children():
+        if isinstance(w, kinds) and w.winfo_manager():  # shown (not e.g. a hidden button)
+            yield w
+        yield from _controls(w)
+
+
+def test_every_control_has_a_tooltip(app):
+    app.open_designer()
+    pump(app.root, lambda: app.designer is not None)
+    toolbar = app.designer.canvas.get_tk_widget().master  # matplotlib's own toolbar has its own
+    missing = [f"{w.winfo_class()} {w.cget('text') if 'text' in w.keys() else ''}"
+               for root in (app.root, app.designer) for w in _controls(root)
+               if not hasattr(w, "tooltip") and not str(w).startswith(str(toolbar))]
+    assert missing == []
+    assert app.zero_btn.cget("text") == "Mark as zero"
+    tip = app.zero_btn.tooltip
+    tip.show()
+    pump(app.root)
+    assert tip._win is not None and "end stop" in tip.text
+    tip._hide()
+    assert tip._win is None

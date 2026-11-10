@@ -11,9 +11,12 @@ the ground truth. Trajectories come from the [designer](designer.md) or from a
 
 ![Main window with callouts](img/gui_main_annotated.png)
 
+Rest the pointer on any button or field for a tooltip explaining it (also in
+the designer).
+
 | # | Feature |
 |---|---|
-| 1 | **Port**: serial port or a `socket://` URL for the emulator. **Connect** reads the device capabilities (board, memory, tick rates, step rate). |
+| 1 | **Port**: the connected USB boards by name (e.g. *Arduino Uno — /dev/ttyACM0*, *ESP32-S3 (native USB) — COM5*) and the emulator; built-in and Bluetooth serial ports are left out. Any port or `socket://` URL can still be typed in. **Rescan** after plugging in a board. **Connect** reads the device capabilities (board, memory, tick rates, step rate). |
 | 2 | **State badge**: offline, idle, loading, ready, armed, running, ABORTED. |
 | 3 | **Open… / Save…** a `.phtraj`, **Designer…**, **Export ground truth…** (CSV). |
 | 4 | **Summary**: shape, periods, cycle length, microstep and tick, segments and checksum, peak speed, max errors, streaming margin, and the warnings. |
@@ -22,7 +25,7 @@ the ground truth. Trajectories come from the [designer](designer.md) or from a
 | 7 | **Trigger** and **Cycles** (0 = until Finish/STOP). The debug triggers show a warning that the motion is not synchronized. |
 | 8 | **Upload** (*Fill stream buffer* for streamed trajectories), **Arm / Start**, **Finish cycle** (stops at the end of the current cycle, back at 0) and **STOP** (immediate). |
 | 9 | **Progress**: upload progress, or the stream buffer level while playing. **Status** queries the cycle, position and overruns. |
-| 10 | **Manual move**: **Jog** a number of steps at a rate, **Set zero** marks the current position as 0, **Go to zero** moves back there at the jog rate (STOP ends it). |
+| 10 | **Manual move**: **Jog** a number of steps at a rate (Hz), **Mark as zero** makes the current position 0 (there is no end stop: the position is a step count), **Go to zero** moves back there at the jog rate (STOP ends it). |
 | 11 | **Log** of every line sent (`>`) and received (`<`), with events and errors coloured. |
 
 ## Triggers
